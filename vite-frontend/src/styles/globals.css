@@ -1,0 +1,124 @@
+@import "tailwindcss";
+
+/* singbox-relay 设计令牌与黑金/岩石色系 */
+:root {
+  --rock: #c8b89a;
+  --rock-rgb: 200, 184, 154;
+  --bg-dark: #050505;
+  --card-dark: rgba(16, 16, 16, 0.65);
+  --sidebar-dark: rgba(10, 10, 10, 0.95);
+  --success: #a3b89a;
+  --danger: #c89a9a;
+  --warn: #e0b84f;
+  --text-muted: #a9a49b;
+  --text-subtle: #8a857c;
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  color-scheme: dark !important;
+}
+
+/* 强制全站深度暗黑背景与浅灰色文字，永不回退浅色 */
+html, body, #root {
+  background-color: #050505 !important;
+  color: #e6e6e6 !important;
+  color-scheme: dark !important;
+}
+
+/* 根除任何遗留的浅色背景类 */
+.bg-white {
+  background-color: rgba(16, 16, 16, 0.75) !important;
+}
+.bg-gray-50 {
+  background-color: rgba(10, 10, 10, 0.85) !important;
+}
+.bg-gray-100 {
+  background-color: rgba(18, 18, 18, 0.85) !important;
+}
+.bg-gray-200 {
+  background-color: rgba(28, 28, 28, 0.85) !important;
+}
+.border-gray-200, .border-gray-100, .border-divider {
+  border-color: rgba(255, 255, 255, 0.08) !important;
+}
+.text-gray-900, .text-gray-800 {
+  color: #e6e6e6 !important;
+}
+.text-gray-700, .text-gray-600 {
+  color: #b8b3a8 !important;
+}
+
+/* 优雅暗色模式滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(200, 184, 154, 0.2);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(200, 184, 154, 0.4);
+}
+
+/* 卡片毛玻璃质感增强 */
+.dark .bg-content1, .bg-content1 {
+  background-color: rgba(16, 16, 16, 0.65) !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+.dark .bg-content2, .bg-content2 {
+  background-color: rgba(22, 22, 22, 0.75) !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+/* 移动端视口高度优化 */
+html, body {
+  height: 100%;
+  overflow-x: hidden;
+}
+
+@supports (height: 100dvh) {
+  .h-screen {
+    height: 100dvh;
+  }
+  .min-h-screen {
+    min-height: 100dvh;
+  }
+}
+
+@supports (-webkit-touch-callout: none) {
+  .h-screen {
+    height: -webkit-fill-available;
+  }
+  
+  .min-h-screen {
+    min-height: -webkit-fill-available;
+  }
+}
+
+@media (max-width: 768px) {
+  * {
+    -webkit-overflow-scrolling: touch;
+  }
+  
+  body {
+    overscroll-behavior-y: none;
+  }
+}
+
+.safe-top {
+  padding-top: var(--safe-area-top);
+}
+
+.safe-bottom {
+  padding-bottom: var(--safe-area-bottom);
+}
+
+@config "../../tailwind.config.js"

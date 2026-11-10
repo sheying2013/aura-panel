@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    
+    <title>Aura Panel</title>
+    <script>
+      // 永久强制暗黑黑金体系（singbox-relay 纯暗黑规范）
+      (function() {
+        document.documentElement.classList.add('dark');
+        document.documentElement.style.colorScheme = 'dark';
+        
+        // 检测H5模式并设置标记
+        const isMobile = window.innerWidth <= 768;
+        const isMobileBrowser = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        const urlParams = new URLSearchParams(window.location.search);
+        const isH5Param = urlParams.get('h5') === 'true';
+        
+        if (isMobile || isMobileBrowser || isH5Param) {
+          document.documentElement.classList.add('h5-mode');
+        } else {
+          document.documentElement.classList.add('pc-mode');
+        }
+      })();
+    </script>
+    <style>
+      :root {
+        --bg: #050505;
+        --fg: #e6e6e6;
+        --rock: #c8b89a;
+        --toaster-bg: #161616;
+        --toaster-color: #e6e6e6;
+        --toaster-border: rgba(255, 255, 255, 0.08);
+      }
+      
+      html, body {
+        margin: 0;
+        padding: 0;
+        background-color: #050505 !important;
+        color: #e6e6e6 !important;
+        color-scheme: dark;
+        overscroll-behavior: none;
+        -webkit-overflow-scrolling: touch;
+      }
+      
+      #root, .h5-mode #root, .pc-mode #root {
+        min-height: 100vh;
+        background-color: #050505 !important;
+        color: #e6e6e6 !important;
+        overscroll-behavior: none;
+      }
+
+      @supports (height: 100dvh) {
+        #root { min-height: 100dvh; }
+      }
+
+      @supports (-webkit-touch-callout: none) {
+        #root { min-height: -webkit-fill-available; }
+      }
+      
+      * {
+        box-sizing: border-box;
+      }
+      
+      @media (max-width: 768px) {
+        html, body {
+          overscroll-behavior: none;
+          -webkit-overflow-scrolling: touch;
+        }
+        .fixed {
+          overscroll-behavior: none;
+        }
+      }
+    </style>
+    <meta key="title" content="Aura Panel" property="og:title" />
+    <meta
+      content="Aura Panel - 高性能流量转发管理系统" property="og:description"
+    />
+    <meta
+      content="Aura Panel - 高性能流量转发管理系统" name="description"
+    />
+    <meta
+      key="viewport"
+      content="viewport-fit=cover, width=device-width, initial-scale=1.0, user-scalable=no"
+      name="viewport"
+    />
+    <link href="/favicon.ico" rel="icon" />
+  </head>
+  <body class="dark bg-[#050505] text-[#e6e6e6]">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

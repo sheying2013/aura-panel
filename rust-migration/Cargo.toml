@@ -1,0 +1,10 @@
+[package]
+name = "flux-migration"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Flux-Panel 拓扑迁移状态机原型（纯逻辑，不连接数据库与 GOST）"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

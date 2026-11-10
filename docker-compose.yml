@@ -1,0 +1,45 @@
+services:
+  backend:
+    image: ghcr.io/sheying2013/aura-panel-backend:latest
+    container_name: aura-backend
+    restart: unless-stopped
+    environment:
+      DB_PATH: /app/data/gost.db
+      JWT_SECRET: ${JWT_SECRET:-aura_secret_key_change_me}
+      LOG_DIR: /app/logs
+      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+    ports:
+      - "${BACKEND_PORT:-6365}:6365"
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    networks:
+      - aura-network
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    image: ghcr.io/sheying2013/aura-panel-frontend:latest
+    container_name: aura-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-6366}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - aura-network
+
+networks:
+  aura-network:
+    name: aura-network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

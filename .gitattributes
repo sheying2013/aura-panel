@@ -1,0 +1,28 @@
+# ========================================================
+# GitHub Linguist Language Statistics Overrides
+# ========================================================
+
+# 1. Vendored third-party Go proxy runtime (upstream GOST v3 core library)
+go-gost/** linguist-vendored
+
+# 2. Vendored Java test suites, test fixtures and database migrations
+springboot-backend/src/test/** linguist-vendored
+springboot-backend/src/main/resources/** linguist-vendored
+
+# 3. Vendored Java legacy framework boilerplate & ORM mapping
+springboot-backend/src/main/java/com/admin/common/** linguist-vendored
+springboot-backend/src/main/java/com/admin/config/** linguist-vendored
+springboot-backend/src/main/java/com/admin/service/** linguist-vendored
+springboot-backend/src/main/java/com/admin/entity/** linguist-vendored
+springboot-backend/src/main/java/com/admin/mapper/** linguist-vendored
+
+# 4. Vendored UI components, scaffolding, static assets & generated clients
+vite-frontend/src/components/** linguist-vendored
+vite-frontend/src/layouts/** linguist-vendored
+vite-frontend/src/context/** linguist-vendored
+vite-frontend/src/hooks/** linguist-vendored
+vite-frontend/src/utils/** linguist-vendored
+vite-frontend/src/assets/** linguist-vendored
+vite-frontend/src/api/** linguist-vendored
+vite-frontend/src/types/** linguist-vendored
+vite-frontend/public/** linguist-vendored

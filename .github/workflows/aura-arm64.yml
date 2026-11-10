@@ -1,0 +1,67 @@
+name: Aura ARM64 build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  images:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: backend
+            context: springboot-backend
+          - component: frontend
+            context: vite-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ARM64 image
+        run: docker build --platform linux/arm64 -f .github/aura/${{ matrix.component }}.Dockerfile -t aura-panel-${{ matrix.component }}:${{ github.sha }} ${{ matrix.context }}
+      - name: Export and hash image
+        run: |
+          docker save aura-panel-${{ matrix.component }}:${{ github.sha }} | gzip > aura-${{ matrix.component }}-arm64.tar.gz
+          sha256sum aura-${{ matrix.component }}-arm64.tar.gz > aura-${{ matrix.component }}-arm64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aura-${{ matrix.component }}-arm64
+          path: |
+            aura-${{ matrix.component }}-arm64.tar.gz
+            aura-${{ matrix.component }}-arm64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+  gost:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-gost/go.mod
+          cache-dependency-path: go-gost/go.sum
+      - name: Build ARM64 node
+        working-directory: go-gost
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o gost-arm64 .
+          sha256sum gost-arm64 > gost-arm64.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aura-gost-arm64
+          path: |
+            go-gost/gost-arm64
+            go-gost/gost-arm64.sha256
+          if-no-files-found: error
+          retention-days: 7
+  rust:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        run: rustup update stable
+      - name: Test rust-compat
+        working-directory: rust-compat
+        run: cargo test --locked
+      - name: Test rust-migration
+        working-directory: rust-migration
+        run: cargo test --locked
