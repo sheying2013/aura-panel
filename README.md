@@ -70,6 +70,7 @@ services:
       DB_PATH: /app/data/gost.db
       LOG_DIR: /app/logs
       JWT_SECRET: ${JWT_SECRET:-aura_secret_key_change_me}
+      APP_CORS_ALLOWED_ORIGIN_PATTERNS: "*"
     volumes:
       - aura-data:/app/data
       - aura-logs:/app/logs

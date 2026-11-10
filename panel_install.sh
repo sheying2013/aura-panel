@@ -193,6 +193,7 @@ services:
       DB_PATH: /app/data/gost.db
       JWT_SECRET: ${JWT_SECRET}
       LOG_DIR: /app/logs
+      APP_CORS_ALLOWED_ORIGIN_PATTERNS: "*"
       JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
     ports:
       - "${BACKEND_PORT}:6365"
@@ -243,6 +244,7 @@ services:
       DB_PATH: /app/data/gost.db
       JWT_SECRET: ${JWT_SECRET}
       LOG_DIR: /app/logs
+      APP_CORS_ALLOWED_ORIGIN_PATTERNS: "*"
       JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
     ports:
       - "${BACKEND_PORT}:6365"
@@ -477,24 +479,27 @@ update_panel() {
 
 # 重置密码
 reset_password() {
-    cd "$INSTALL_DIR"
     local db_file="$INSTALL_DIR/data/gost.db"
+    local changed
     if [[ ! -f "$db_file" ]]; then
-        error "未找到数据库文件 $db_file，请确认服务已启动。"
+        error "未找到数据库文件 ${db_file}，请确认服务已启动。"
         return 1
     fi
-    info "重置管理员密码为默认值: admin"
-    # Spring Boot BCrypt 加密或通过 sqlite3 更新
-    if command -v sqlite3 &>/dev/null; then
-        # 默认 admin 经过 BCrypt 对应密文或明文标记
-        sqlite3 "$db_file" "UPDATE user SET password = 'admin' WHERE id = 1 OR role_id = 0;" 2>/dev/null || true
-        success "密码重置指令已写入数据库，请重启服务生效！"
-        restart_panel
-    else
-        warn "系统未安装 sqlite3 工具，可通过容器内执行重置。"
-        docker exec -it aura-backend sh -c "echo 'UPDATE user SET password = "admin" WHERE id = 1;' | sqlite3 /app/data/gost.db" 2>/dev/null || true
-        success "管理员密码已恢复为默认值 admin"
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        error "系统未安装 sqlite3，请先安装后重试。"
+        return 1
     fi
+    # pwd 保存 MD5；递增 token_version，使重置前的登录令牌失效。
+    # 仅修改初始管理员，避免误改其他管理员或普通用户。
+    if ! changed=$(sqlite3 -bail -cmd '.timeout 5000' "$db_file"         "BEGIN IMMEDIATE; UPDATE user SET pwd = '21232f297a57a5a743894a0e4a801fc3', token_version = COALESCE(token_version, 0) + 1 WHERE id = 1 AND role_id = 0; SELECT changes(); COMMIT;"); then
+        error "密码重置失败，数据库未完成更新。"
+        return 1
+    fi
+    if [[ "$changed" != "1" ]]; then
+        error "未找到 ID 为 1 的管理员，密码未重置。"
+        return 1
+    fi
+    success "初始管理员密码已重置为 admin，请立即登录并修改密码。"
 }
 
 # 彻底卸载面板

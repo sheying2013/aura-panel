@@ -127,7 +127,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         if (Integer.valueOf(0).equals(user.getStatus())) return R.err("账号被停用");
         loginLimiter.reset(limitKey);
         String token = JwtUtil.generateToken(user);
-        boolean requirePasswordChange = Objects.equals(loginDto.getUsername(), "admin_user") || Objects.equals(loginDto.getPassword(), "admin_user");
+        boolean requirePasswordChange = Objects.equals(loginDto.getPassword(), "admin");
         return R.ok(MapUtil.builder()
                 .put("token", token)
                 .put("name", user.getUser())

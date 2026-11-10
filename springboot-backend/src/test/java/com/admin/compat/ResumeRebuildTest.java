@@ -51,7 +51,7 @@ import static org.mockito.Mockito.when;
 /**
  * 恢复时节点上已经没有这条服务（round27）。
  *
- * <p>真机复现（159.54.178.84，forward 3 / node2 / 30200）：
+ * <p>故障复现（forward 3 / node2 / 30200）：
  * 暂停中的转发在节点重装后不会进补齐——resyncNodeServices 只补 status=1 的服务；
  * 用户点恢复，节点回 "service 3_1_0_tcp configuration not found"，
  * 接口 code=0、库里 status=1，但节点上没有任何监听，30200 一直是关的，

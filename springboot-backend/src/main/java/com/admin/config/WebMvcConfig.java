@@ -28,11 +28,10 @@ public class WebMvcConfig implements WebMvcConfigurer {
     private JwtInterceptor jwtInterceptor;
 
     /**
-     * 允许跨域的源。默认只放行本机开发端口和 App/本地文件 WebView（浏览器对 file:// 页面发的是
-     * 字面量 Origin: null），不再是通配 *。部署到公网域名时用
-     * APP_CORS_ALLOWED_ORIGIN_PATTERNS 显式列出本站地址；同源访问本来就不经过 CORS，无需配置。
+     * 允许跨域的源。默认设为通配 *，兼容外网域名反向代理、TLS 终结及多端口前后端分离访问；
+     * 生产环境如需严格收窄，可通过环境变量 APP_CORS_ALLOWED_ORIGIN_PATTERNS 显式指定允许的 Origin 列表。
      */
-    @Value("${app.cors.allowed-origin-patterns:http://localhost:[*],http://127.0.0.1:[*],https://localhost:[*],https://127.0.0.1:[*],null}")
+    @Value("${app.cors.allowed-origin-patterns:*}")
     private String[] allowedOriginPatterns;
 
     /**
