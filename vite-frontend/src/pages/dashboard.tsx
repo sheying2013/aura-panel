@@ -5,6 +5,10 @@ import toast from 'react-hot-toast';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
 import { getUserPackageInfo } from "@/api";
+import Network from '@/api/network';
+
+import { NODE_STATUS_ORDER, nodeHealthStatusOf, resolveNodeHealthCounts } from './nodeHealthView';
+import type { NodeHealthStatus, NodeHealthSummary } from './nodeHealthView';
 
 interface UserInfo {
   flow: number;
@@ -57,6 +61,14 @@ interface AddressItem {
   copying?: boolean;
 }
 
+// 节点健康状态/计数口径统一在 ./nodeHealthView：过期结论一律按 UNKNOWN 展示与计数
+const NODE_STATUS_META: Record<NodeHealthStatus, { label: string; tile: string; dot: string; text: string }> = {
+  ONLINE: { label: '在线', tile: 'bg-[#a3b89a]/70 border-[#a3b89a]/80 hover:border-[#c8b89a]', dot: 'bg-[#a3b89a]', text: 'text-[#a3b89a]' },
+  DEGRADED: { label: '降级', tile: 'bg-[#e0b84f]/60 border-[#e0b84f]/70 hover:border-[#c8b89a]', dot: 'bg-[#e0b84f]', text: 'text-[#e0b84f]' },
+  OFFLINE: { label: '离线', tile: 'bg-[#c89a9a]/40 border-[#c89a9a]/50 hover:border-[#c8b89a]', dot: 'bg-[#c89a9a]', text: 'text-[#c89a9a]' },
+  UNKNOWN: { label: '未知', tile: 'bg-white/[0.04] border-dashed border-white/20 hover:border-[#c8b89a]/60', dot: 'bg-white/30', text: 'text-[#8a857c]' },
+};
+
 export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -68,6 +80,16 @@ export default function DashboardPage() {
   const [addressModalOpen, setAddressModalOpen] = useState(false);
   const [addressModalTitle, setAddressModalTitle] = useState('');
   const [addressList, setAddressList] = useState<AddressItem[]>([]);
+
+  // 节点健康摘要：/api/v1/node/health/summary 带 @RequireRole，仅 role_id=0 的管理员可读，非管理员不发起请求
+  const [nodeHealth, setNodeHealth] = useState<NodeHealthSummary | null>(null);
+  const [nodeHealthState, setNodeHealthState] = useState<'idle' | 'loading' | 'ready' | 'error' | 'denied'>('idle');
+  const [nodeHealthError, setNodeHealthError] = useState('');
+  const isAdmin = (() => {
+    const flag = localStorage.getItem('admin');
+    if (flag !== null) return flag === 'true';
+    return parseInt(localStorage.getItem('role_id') || '1', 10) === 0;
+  })();
 
   // 检查有效期通知
   const checkExpirationNotifications = (info: UserInfo, tunnels: UserTunnel[]) => {
@@ -104,6 +126,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     loadPackageData();
+    loadNodeHealth();
     localStorage.setItem('e', '/dashboard');
   }, []);
 
@@ -117,21 +140,77 @@ export default function DashboardPage() {
         setForwardList(data.forwards || []);
         setStatisticsFlows(data.statisticsFlows || []);
         checkExpirationNotifications(data.userInfo, data.tunnelPermissions || []);
+        return true;
       }
+      console.error('获取面板数据失败:', res.msg);
+      return false;
     } catch (error) {
       console.error('获取面板数据失败:', error);
+      return false;
     } finally {
       setLoading(false);
-      setRefreshing(false);
     }
   };
 
+  // 只读取后端最近一次控制通道往返检测的结果，不在浏览器侧发起任何探测；页面刷新也不会重新检测
+  const loadNodeHealth = async () => {
+    if (!isAdmin) {
+      setNodeHealthState('denied');
+      return true; // 普通用户无需请求管理员接口
+    }
+    setNodeHealthState('loading');
+    setNodeHealthError('');
+    try {
+      const res = await Network.post<NodeHealthSummary | null>('/node/health/summary');
+      if (res.code === 0) {
+        if (!res.data || !Array.isArray(res.data.nodes)) {
+          setNodeHealth(null);
+          setNodeHealthError('后端未返回 nodes 数组');
+          setNodeHealthState('error');
+          return false;
+        }
+        setNodeHealth(res.data);
+        setNodeHealthState('ready');
+        return true;
+      } else if (res.code === 403) {
+        setNodeHealth(null);
+        setNodeHealthState('denied');
+      } else {
+        setNodeHealth(null);
+        setNodeHealthError(res.msg || '未知错误');
+        setNodeHealthState('error');
+      }
+    } catch (error) {
+      setNodeHealth(null);
+      setNodeHealthError(error instanceof Error ? error.message : '网络请求失败');
+      setNodeHealthState('error');
+    }
+    return false;
+  };
+
+  const formatCheckedAt = (checkedAt?: number | null): string => {
+    if (checkedAt == null) return '时间未知';
+    const time = new Date(checkedAt);
+    if (isNaN(time.getTime())) return '时间无效';
+    const pad = (value: number) => value.toString().padStart(2, '0');
+    return `${pad(time.getMonth() + 1)}-${pad(time.getDate())} ${pad(time.getHours())}:${pad(time.getMinutes())}:${pad(time.getSeconds())}`;
+  };
+
+  // 摘要接口只读；刷新最新结果不会触发新的节点探测
   const handleRefresh = async () => {
     setRefreshing(true);
-    await loadPackageData();
-    toast.success("数据已刷新", {
-      style: { background: '#141414', color: '#c8b89a', border: '1px solid rgba(200,184,154,0.25)' }
-    });
+    try {
+      const [packageOk, nodeHealthOk] = await Promise.all([loadPackageData(), loadNodeHealth()]);
+      if (packageOk && nodeHealthOk) {
+        toast.success("数据已刷新", {
+          style: { background: '#141414', color: '#c8b89a', border: '1px solid rgba(200,184,154,0.25)' }
+        });
+      } else {
+        toast.error("部分数据刷新失败，请重试");
+      }
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   const formatFlow = (value: number | undefined | null, unit: string = 'bytes'): string => {
@@ -432,6 +511,14 @@ export default function DashboardPage() {
     return (forward.inFlow || 0) + (forward.outFlow || 0);
   };
 
+  const nodeHealthNodes = nodeHealth?.nodes ?? [];
+  // 统计与明细同源：有明细就按明细重算，过期结论落进未知并单独记 staleCount
+  const healthCounts = resolveNodeHealthCounts(nodeHealth, nodeHealthNodes);
+  const healthTotal = healthCounts.total;
+  const healthOnline = healthCounts.online;
+  const healthUnknown = healthCounts.unknown;
+  const healthStale = healthCounts.staleCount;
+
   if (loading) {
     return (
       <div className="px-3 lg:px-6 flex-grow pt-4">
@@ -548,6 +635,109 @@ export default function DashboardPage() {
             </div>
           </div>
         </div>
+      </div>
+
+      {/* 节点健康矩阵：仅管理员可读（/node/health/summary 带 @RequireRole）；状态来自控制通道往返检测，非业务链路 */}
+      <div className="bg-[rgba(16,16,16,0.65)] backdrop-blur-md border border-white/[0.08] hover:border-[#c8b89a]/30 transition-all duration-300 rounded-xl px-4 py-3 shadow-sm">
+        <div className="flex items-center justify-between gap-3 pb-2.5 border-b border-white/[0.06]">
+          <div className="flex items-center gap-2.5">
+            <div className="w-1.5 h-3.5 bg-[#c8b89a] rounded-sm" />
+            <h2 className="text-xs lg:text-sm font-medium text-[#e6e6e6] tracking-wide">节点健康矩阵</h2>
+          </div>
+          <span className="text-[11px] font-mono text-[#8a857c]">
+            上次检测在线 <span className="text-[#a3b89a] font-medium">{nodeHealthState === 'ready' ? healthOnline : '—'}</span>
+            {' / '}总数 {nodeHealthState === 'ready' ? healthTotal : '—'}
+            {nodeHealthState === 'ready' && healthUnknown > 0 && (
+              <span className="text-[#e0b84f]"> · 未知 {healthUnknown}</span>
+            )}
+            {nodeHealthState === 'ready' && healthStale > 0 && (
+              <span className="text-[#8a857c]"> · 其中旧结果 {healthStale}</span>
+            )}
+          </span>
+        </div>
+
+        {nodeHealthState === 'ready' && nodeHealth?.stateHealthy === false && (
+          <p role="alert" className="pt-2 text-[11px] text-[#c89a9a]">检测状态保存异常，自动检测可能暂停；请检查面板日志及数据目录权限。</p>
+        )}
+        {nodeHealthState === 'denied' ? (
+          <div className="flex items-center gap-2 py-3 text-[11px] font-mono text-[#8a857c]">
+            <svg className="w-3.5 h-3.5 text-[#555] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} />
+            </svg>
+            <span>当前账号无节点健康查看权限，仅管理员可读取健康摘要</span>
+          </div>
+        ) : nodeHealthState === 'loading' || nodeHealthState === 'idle' ? (
+          <div className="flex items-center gap-2 py-3 text-[11px] font-mono text-[#8a857c]">
+            <span className="animate-spin h-3 w-3 border border-white/10 border-t-[#c8b89a] rounded-full" />
+            <span>正在读取节点健康摘要…</span>
+          </div>
+        ) : nodeHealthState === 'error' ? (
+          <div className="flex items-center justify-between gap-3 py-3 text-[11px] font-mono">
+            <span className="text-[#c89a9a] truncate">节点健康摘要读取失败：{nodeHealthError}</span>
+            <Button className="text-[#c8b89a] text-xs h-7 px-2 shrink-0" size="sm" variant="light" onClick={loadNodeHealth}>重试</Button>
+          </div>
+        ) : nodeHealthNodes.length === 0 ? (
+          <div className="flex items-center gap-2 py-3 text-[11px] font-mono text-[#8a857c]">
+            <span className="w-3 h-3 rounded-[3px] border border-white/10 bg-white/[0.04]" />
+            <span>暂无节点（后端返回空节点数组）</span>
+          </div>
+        ) : (
+          <div className="pt-2.5 space-y-2.5">
+            <div className="flex items-start gap-3">
+              <div className="flex flex-wrap gap-1.5">
+                {nodeHealthNodes.map((node) => {
+                  const status = nodeHealthStatusOf(node);
+                  const meta = NODE_STATUS_META[status];
+                  const history = node.stale
+                    ? `（旧结果 ${node.staleNote || '上次结论已过期，不计入在线'}）${node.lastLatencyMs != null ? ` · 上次延迟 ${node.lastLatencyMs}ms` : ''}`
+                    : '';
+                  return (
+                    <div
+                      key={node.nodeId}
+                      className={`w-6 h-6 rounded-[5px] border cursor-help transition-colors ${meta.tile}`}
+                      title={`${node.nodeName || '未命名节点'} · ${meta.label} · 检测 ${formatCheckedAt(node.checkedAt)}${history}${node.detail ? ` · ${node.detail}` : ''} · ID ${node.nodeId}`}
+                    />
+                  );
+                })}
+              </div>
+              <div className="ml-auto flex flex-col items-end gap-1 text-[10px] font-mono text-[#8a857c] shrink-0">
+                <div className="flex items-center gap-3">
+                  {NODE_STATUS_ORDER.map((status) => (
+                    <span key={status} className="flex items-center gap-1">
+                      <span className={`w-2 h-2 rounded-[2px] ${NODE_STATUS_META[status].dot}`} />
+                      {NODE_STATUS_META[status].label}
+                    </span>
+                  ))}
+                </div>
+                <span className="text-[#555]">显示最近一次控制通道检测 · 非业务链路 · 刷新不触发检测</span>
+              </div>
+            </div>
+
+            <div className="space-y-1 max-h-40 overflow-y-auto pr-1 pt-2 border-t border-white/[0.06]">
+              {nodeHealthNodes.map((node) => {
+                const status = nodeHealthStatusOf(node);
+                const meta = NODE_STATUS_META[status];
+                return (
+                  <div
+                    key={node.nodeId}
+                    className="flex items-center justify-between gap-3 text-[10px] font-mono"
+                    title={node.detail || undefined}
+                  >
+                    <span className="flex items-center gap-1.5 min-w-0">
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${meta.dot}`} />
+                      <span className="text-[#e6e6e6] truncate">{node.nodeName || `节点 ${node.nodeId}`}</span>
+                      <span className={`${meta.text} shrink-0`}>{meta.label}</span>
+                      {node.stale && <span className="text-[#e0b84f] shrink-0">旧结果</span>}
+                    </span>
+                    <span className="text-[#8a857c] shrink-0">
+                      {node.stale ? '上次 ' : ''}{formatCheckedAt(node.checkedAt)}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* 24小时流量趋势分析 */}
@@ -756,21 +946,25 @@ export default function DashboardPage() {
                           </div>
 
                           <div className="space-y-1">
-                            <code 
-                              className={`block px-2 py-1 bg-black/60 border border-white/5 hover:border-[#c8b89a]/40 text-[#c8b89a] rounded font-mono text-[11px] truncate transition-colors ${hasMultipleIps(forward.inIp) ? 'cursor-pointer hover:bg-[#c8b89a]/10' : ''}`}
-                              onClick={() => hasMultipleIps(forward.inIp) && showAddressModal(forward.inIp, forward.inPort, '入口地址')}
+                            <button
+                              type="button"
+                              disabled={!hasMultipleIps(forward.inIp)}
+                              className={`block w-full text-left px-2 py-1 bg-black/60 border border-white/5 hover:border-[#c8b89a]/40 text-[#c8b89a] rounded font-mono text-[11px] truncate transition-colors ${hasMultipleIps(forward.inIp) ? 'cursor-pointer hover:bg-[#c8b89a]/10' : ''}`}
+                              onClick={() => showAddressModal(forward.inIp, forward.inPort, '入口地址')}
                               title={formatInAddress(forward.inIp, forward.inPort)}
                             >
                               {formatInAddress(forward.inIp, forward.inPort)}
-                            </code>
+                            </button>
                             <div className="text-center text-[#555] text-[10px] leading-none">↓</div>
-                            <code 
-                              className={`block px-2 py-1 bg-black/60 border border-white/5 hover:border-[#c8b89a]/30 text-[#e6e6e6] rounded font-mono text-[11px] truncate transition-colors ${hasMultipleRemoteAddresses(forward.remoteAddr) ? 'cursor-pointer hover:bg-[#c8b89a]/10' : ''}`}
-                              onClick={() => hasMultipleRemoteAddresses(forward.remoteAddr) && showRemoteAddressModal(forward.remoteAddr, '出口地址')}
+                            <button
+                              type="button"
+                              disabled={!hasMultipleRemoteAddresses(forward.remoteAddr)}
+                              className={`block w-full text-left px-2 py-1 bg-black/60 border border-white/5 hover:border-[#c8b89a]/30 text-[#e6e6e6] rounded font-mono text-[11px] truncate transition-colors ${hasMultipleRemoteAddresses(forward.remoteAddr) ? 'cursor-pointer hover:bg-[#c8b89a]/10' : ''}`}
+                              onClick={() => showRemoteAddressModal(forward.remoteAddr, '出口地址')}
                               title={formatRemoteAddress(forward.remoteAddr)}
                             >
                               {formatRemoteAddress(forward.remoteAddr)}
-                            </code>
+                            </button>
                           </div>
                         </div>
                         

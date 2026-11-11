@@ -568,13 +568,14 @@ func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
 		response.Type = "UnknownCommandResponse"
 	}
 
-	// 发送响应
-	if err != nil {
+	// TcpPing is a read-only diagnostic and must not rewrite node configuration.
+	if cmd.Type != "TcpPing" {
 		saveConfig()
+	}
+	if err != nil {
 		response.Success = false
 		response.Message = err.Error()
 	} else {
-		saveConfig()
 		response.Success = true
 		response.Message = "OK"
 	}

@@ -79,6 +79,11 @@ class ExpiryResumeTest {
         when(chainTunnelService.list(any())).thenReturn(List.of(chainTunnel()));
         // 节点不可达：applyStatusChange 只记说明，仍把库改对
         when(nodeService.getById(any())).thenReturn(null);
+        when(forwardMapper.selectById(any())).thenAnswer(invocation -> {
+            List<Forward> rows = forwardMapper.selectList(null);
+            return rows == null ? null : rows.stream()
+                    .filter(f -> f.getId().equals(invocation.getArgument(0))).findFirst().orElse(null);
+        });
         when(forwardMapper.updateById(any(Forward.class))).thenReturn(1);
         when(userTunnelService.getOne(any())).thenReturn(null);
     }
@@ -166,6 +171,39 @@ class ExpiryResumeTest {
         R r = service.updateUserTunnel(dto);
 
         assertEquals(0, r.getCode(), "更新成功后必须返回成功（基线无条件返回失败）");
+    }
+
+    @Test
+    void autoResumeRechecksOwnerAfterTakingForwardLock() {
+        when(userService.getById(any())).thenReturn(user(1, NOW + 86_400_000L), user(0, NOW + 86_400_000L));
+        when(forwardMapper.selectList(any())).thenReturn(new ArrayList<>(List.of(forward(0, PauseReason.EXPIRY))));
+        List<String> notes = forwardService.resumeExpiryDisabledPausedForUser(USER_ID);
+        verify(forwardMapper, never()).updateById(any(Forward.class));
+        assertTrue(notes.stream().anyMatch(n -> n.contains("账号当前不可用")), notes.toString());
+    }
+
+    @Test
+    void staleDisableOperationDoesNotPauseReenabledAccount() {
+        when(userService.getById(any())).thenReturn(user(1, NOW + 86_400_000L));
+        when(forwardMapper.selectList(any())).thenReturn(new ArrayList<>(List.of(forward(1, ""))));
+        forwardService.pauseForDisabledUser(USER_ID);
+        verify(forwardMapper, never()).updateById(any(Forward.class));
+    }
+
+    @Test
+    void disabledPauseCanRetryAfterForwardLockIsReleased() {
+        when(userService.getById(any())).thenReturn(user(0, NOW + 86_400_000L));
+        when(forwardMapper.selectList(any())).thenReturn(new ArrayList<>(List.of(forward(1, ""))));
+        try (var held = com.admin.common.utils.ForwardWriteLocks.acquire(0, 31L)) {
+            assertTrue(held != null);
+            List<String> first = forwardService.pauseForDisabledUser(USER_ID);
+            assertTrue(first.stream().anyMatch(n -> n.contains("正在修改")), first.toString());
+            verify(forwardMapper, never()).updateById(any(Forward.class));
+        }
+        forwardService.pauseForDisabledUser(USER_ID);
+        Forward updated = capturedUpdate();
+        assertEquals(0, updated.getStatus());
+        assertEquals(PauseReason.DISABLED, updated.getPauseReason());
     }
 
     private Forward capturedUpdate() {

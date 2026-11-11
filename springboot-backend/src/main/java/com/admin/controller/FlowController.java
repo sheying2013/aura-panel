@@ -9,6 +9,7 @@ import com.admin.common.utils.AESCrypto;
 import com.admin.common.utils.FlowBilling;
 import com.admin.common.utils.FlowReportDedup;
 import com.admin.common.utils.FlowReportDedupStore;
+import com.admin.common.utils.ForwardWriteLocks;
 import com.admin.common.utils.GostUtil;
 import com.admin.common.utils.PauseReason;
 import com.admin.common.utils.QuotaResume;
@@ -404,7 +405,20 @@ public class FlowController extends BaseController {
      * @param reason {@link PauseReason} 之一：quota / expiry / disabled；传 null 表示不标注
      */
     public void pauseService(List<Forward> forwardList, String reason) {
-        for (Forward forward : forwardList) {
+        for (Forward snapshot : forwardList) {
+            if (snapshot == null || snapshot.getId() == null) continue;
+            ForwardWriteLocks.Lease lease = ForwardWriteLocks.tryAcquire(snapshot.getId());
+            if (lease == null) {
+                log.warn("转发 {} 正在修改，流量触发的暂停未执行，等待后续检查", snapshot.getId());
+                continue;
+            }
+            try {
+            Forward forward = forwardService.getById(snapshot.getId());
+            if (forward == null || !Objects.equals(forward.getStatus(), 1)
+                    || !Objects.equals(forward.getUserId(), snapshot.getUserId())
+                    || !Objects.equals(forward.getTunnelId(), snapshot.getTunnelId())) {
+                continue;
+            }
             String name = resolveServiceName(forward);
             if (name == null) {
                 log.warn("转发 {} 无法确定对应的用户隧道，跳过暂停", forward.getId());
@@ -422,7 +436,10 @@ public class FlowController extends BaseController {
             forward.setStatus(0);
             forward.setPauseReason(reason);
             forward.setUpdatedTime(System.currentTimeMillis());
-            forwardService.updateById(forward);
+            if (!forwardService.updateById(forward)) {
+                log.warn("转发 {} 暂停状态写库失败，本次未下发节点", forward.getId());
+                continue;
+            }
 
             List<String> notes = new ArrayList<>();
             for (ChainTunnel chainTunnel : chainTunnels) {
@@ -434,6 +451,9 @@ public class FlowController extends BaseController {
             if (!notes.isEmpty()) {
                 log.warn("转发 {} 已记为{}（{}），{} 个入口节点未确认：{}，等待节点重连后补偿",
                         forward.getId(), PauseReason.label(reason), reason, notes.size(), String.join("；", notes));
+            }
+            } finally {
+                lease.close();
             }
         }
     }

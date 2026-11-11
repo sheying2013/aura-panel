@@ -123,6 +123,8 @@ class ResyncChainTest {
         ReflectionTestUtils.setField(forwardService, "userTunnelService", mock(UserTunnelService.class));
         ReflectionTestUtils.setField(forwardService, "userService", mock(UserService.class));
 
+        when(forwardMapper.selectById(any())).thenAnswer(invocation ->
+                allForwards.stream().filter(f -> f.getId().equals(invocation.getArgument(0))).findFirst().orElse(null));
         when(forwardMapper.selectList(any())).thenAnswer(invocation -> {
             Object wrapper = invocation.getArgument(0);
             // QueryWrapper.toString() 只有类名与哈希（已实测），要看条件必须取 getSqlSegment()

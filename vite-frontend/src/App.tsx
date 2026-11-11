@@ -5,6 +5,7 @@ import IndexPage from "@/pages/index";
 import ChangePasswordPage from "@/pages/change-password";
 import DashboardPage from "@/pages/dashboard";
 import ForwardPage from "@/pages/forward";
+import DdnsManagement from "@/components/DdnsManagement";
 import TunnelPage from "@/pages/tunnel";
 import NodePage from "@/pages/node";
 import UserPage from "@/pages/user";
@@ -173,6 +174,7 @@ function App() {
           </ProtectedRoute>
         } 
       />
+      <Route path="/ddns" element={<ProtectedRoute><DdnsManagement /></ProtectedRoute>} />
       <Route 
         path="/tunnel" 
         element={

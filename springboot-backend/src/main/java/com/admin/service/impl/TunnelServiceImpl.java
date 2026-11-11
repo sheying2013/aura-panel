@@ -5,7 +5,10 @@ import com.admin.common.dto.*;
 import com.admin.common.lang.R;
 import com.admin.common.utils.GostUtil;
 import com.admin.common.utils.JwtUtil;
+import com.admin.common.utils.ResourceLifecycleLocks;
 import com.admin.common.utils.WebSocketServer;
+import com.admin.ddns.DdnsDomainGate;
+import com.admin.ddns.DdnsTargetRenderer;
 import com.admin.entity.*;
 import com.admin.mapper.TunnelMapper;
 import com.admin.mapper.UserTunnelMapper;
@@ -1334,6 +1337,27 @@ public class TunnelServiceImpl extends ServiceImpl<TunnelMapper, Tunnel> impleme
     @Override
     public R deleteTunnel(Long id) {
         if (id == null) return R.err("隧道ID不能为空");
+
+        // 生命周期锁（单 JVM）：createForward 会在校验通过后先落 forward 行、再逐入口节点下发服务。
+        // 本方法此前的两道漂移检查都只能看见「读快照之后再长出来的库行」，看不见「检查通过之后、
+        // purge 之前才插入的行」——那条转发的行会被 purge 删掉，而它的节点服务这时候可能还没建完，
+        // 建完就再没有任何记录能对上。锁把创建侧的「校验 → 落库 → 下发」与本方法的
+        // 「读快照 → 删行 → 节点清理」整段互斥，一直持到节点资源清完。
+        ResourceLifecycleLocks.Lease lifecycleLease = ResourceLifecycleLocks.acquire(
+                ResourceLifecycleLocks.DELETE_WAIT_MILLIS, ResourceLifecycleLocks.tunnelKey(id));
+        if (lifecycleLease == null) {
+            return R.err("隧道正在被创建/删除，本次未删除任何数据，请稍后重试");
+        }
+        try {
+            return deleteTunnelLocked(id);
+        } finally {
+            lifecycleLease.close();
+        }
+    }
+
+    /** 生命周期锁内的删除：行集、DDNS 凭证、级联 purge 与节点清理都在同一临界区里。 */
+    private R deleteTunnelLocked(Long id) {
+        // 持锁后重读：等锁期间隧道可能已被另一个删除请求清掉，按旧结论继续会把已经不存在的东西再删一遍
         Tunnel tunnel = this.getById(id);
         if (tunnel == null) return R.err("隧道不存在");
         List<Forward> forwardList = forwardService.list(new QueryWrapper<Forward>().eq("tunnel_id", id));
@@ -1342,33 +1366,111 @@ public class TunnelServiceImpl extends ServiceImpl<TunnelMapper, Tunnel> impleme
         List<ChainTunnel> chainTunnels = chainTunnelService.list(new QueryWrapper<ChainTunnel>().eq("tunnel_id", id));
         List<SpeedLimit> speedLimits = speedLimitService.list(new QueryWrapper<SpeedLimit>().eq("tunnel_id", id));
 
-        // 转发自带的服务按转发粒度命名，隧道级清理覆盖不到，必须先逐条删
-        for (Forward forward : forwardList) {
-            forwardService.deleteForward(forward.getId());
-        }
+        // 转发自带的服务按转发粒度命名，隧道级清理覆盖不到，必须先逐条删；但删除会往每条转发的
+        // 目标域名下发 DeleteService，DDNS 切换又在同一批域名上改地址 —— 两边必须互斥到级联事务
+        // 结束：否则「切换刚把新地址写进服务」和「库行已删」会同时成立，节点上留下一条再没有记录
+        // 能对上的服务。一次拿全部域名的共享凭证（闸门内部按排序键加锁，逐条取锁会与切换线程交叉
+        // 成环）；拿不到就一个字节都不删。deleteForward 自己还会对同一域名再取一次读锁，同线程
+        // 重入直接成功，不会等成死锁。
+        Set<String> lockedHosts = lockedTargets(forwardList);
+        DdnsDomainGate.Lease ddnsLease = DdnsTargetRenderer.beginDispatch(dispatchTargets(forwardList));
+        if (ddnsLease == null) return R.err(ddnsBusyMessage(lockedHosts));
+        try {
+            // 快照是加锁之前读的：这期间并发新增的转发、被改到别的域名的转发都不在这份锁里
+            R drift = forwardSnapshotDrift(id, forwardList, lockedHosts);
+            if (drift != null) return drift;
 
-        // 多表删除收在一个事务里，且不与任何节点下发混在一起：节点离线/超时会一直占着数据库连接
-        cascadeDeletePurger.purgeTunnelDatabaseRecords(id,
-                forwardList.stream().map(Forward::getId).collect(Collectors.toList()));
+            List<String> ddnsBlocked = new ArrayList<>();
+            for (Forward forward : forwardList) {
+                R result = forwardService.deleteForward(forward.getId());
+                if (result != null && result.getCode() == 0) continue;
+                // DDNS 目标上的转发被拒：它可能刚拿到新地址，记录一删就再没人对账，必须整个停下来；
+                // 非 DDNS 转发维持原语义（端口行孤儿比节点残留更不可恢复）。
+                if (!DdnsDomainGate.targetHosts(forward.getRemoteAddr()).isEmpty()) {
+                    ddnsBlocked.add("转发" + forward.getId() + "(" + (result == null ? "无返回" : result.getMsg()) + ")");
+                }
+            }
+            if (!ddnsBlocked.isEmpty()) {
+                log.warn("隧道 {} 删除中止：DDNS 目标转发未删除 {}", id, String.join("，", ddnsBlocked));
+                return R.err("DDNS 目标转发未能删除，已中止级联清理以保留记录：" + String.join("，", ddnsBlocked));
+            }
 
-        // 真机缺陷（tunnel 5）：入口行(chainType=1)只删 chains，节点上的 <tunnelId>_tls 服务留在 gost.json 里，
-        // 重启被 loader 重新拉起继续占端口。不再按 chainType 猜该节点有什么资源，
-        // 而是对每个出现过的节点都尝试删 chains、service 与限流器：Delete* 已把 not found 归一成 OK，
-        // 重复调用幂等，多删一次不存在的东西不算失败。
-        List<String> leftovers = new ArrayList<>();
-        Set<Long> cleanedNodes = new LinkedHashSet<>();
-        for (ChainTunnel chainTunnel : chainTunnels) {
-            // 同一节点多行只清一次，避免重复下发
-            if (!cleanedNodes.add(chainTunnel.getNodeId())) continue;
-            cleanTunnelResources(chainTunnel.getNodeId(), id, leftovers);
-            cleanTunnelLimiters(chainTunnel.getNodeId(), speedLimits, leftovers);
+            // 落库前再挡一次：这期间新长出来的转发，目标域名不在我们手里的锁上
+            drift = forwardSnapshotDrift(id, forwardList, lockedHosts);
+            if (drift != null) return drift;
+
+            // 多表删除收在一个事务里，且不与任何节点下发混在一起：节点离线/超时会一直占着数据库连接
+            cascadeDeletePurger.purgeTunnelDatabaseRecords(id,
+                    forwardList.stream().map(Forward::getId).collect(Collectors.toList()));
+
+            // 真机缺陷（tunnel 5）：入口行(chainType=1)只删 chains，节点上的 <tunnelId>_tls 服务留在 gost.json 里，
+            // 重启被 loader 重新拉起继续占端口。不再按 chainType 猜该节点有什么资源，
+            // 而是对每个出现过的节点都尝试删 chains、service 与限流器：Delete* 已把 not found 归一成 OK，
+            // 重复调用幂等，多删一次不存在的东西不算失败。
+            List<String> leftovers = new ArrayList<>();
+            Set<Long> cleanedNodes = new LinkedHashSet<>();
+            for (ChainTunnel chainTunnel : chainTunnels) {
+                // 同一节点多行只清一次，避免重复下发
+                if (!cleanedNodes.add(chainTunnel.getNodeId())) continue;
+                cleanTunnelResources(chainTunnel.getNodeId(), id, leftovers);
+                cleanTunnelLimiters(chainTunnel.getNodeId(), speedLimits, leftovers);
+            }
+            if (!leftovers.isEmpty()) {
+                // 记录已删、节点侧可能还留着资源：如实带出，由运维手工核查
+                log.warn("隧道 {} 已删除，但节点资源清理未完成：{}", id, String.join("，", leftovers));
+                return R.ok(leftovers);
+            }
+            return R.ok();
+        } finally {
+            ddnsLease.close();
         }
-        if (!leftovers.isEmpty()) {
-            // 记录已删、节点侧可能还留着资源：如实带出，由运维手工核查
-            log.warn("隧道 {} 已删除，但节点资源清理未完成：{}", id, String.join("，", leftovers));
-            return R.ok(leftovers);
+    }
+
+    /** 把所有转发的目标地址拼成一份（与 remote_addr 同格式，逗号分隔），交给闸门一次按域名加锁。 */
+    private static String dispatchTargets(List<Forward> forwards) {
+        StringBuilder merged = new StringBuilder();
+        for (Forward forward : forwards) {
+            String remoteAddr = forward.getRemoteAddr();
+            if (remoteAddr == null || remoteAddr.trim().isEmpty()) continue;
+            if (merged.length() > 0) merged.append(',');
+            merged.append(remoteAddr.trim());
         }
-        return R.ok();
+        return merged.toString();
+    }
+
+    private static Set<String> lockedTargets(List<Forward> forwards) {
+        return new LinkedHashSet<>(DdnsDomainGate.targetHosts(dispatchTargets(forwards)));
+    }
+
+    private static String ddnsBusyMessage(Set<String> hosts) {
+        return "目标域名正在 DDNS 切换（" + String.join("，", hosts) + "），本次删除未执行，请稍后重试";
+    }
+
+    /**
+     * 持锁后重读转发，确认锁外没有新东西：并发新增的行（目标域名没加锁）、被改到未加锁域名的行。
+     * 命中即整体放弃 —— 按旧快照照样删下去，同样会留下「切换已把新地址写进服务、库行却已删」的残留。
+     */
+    private R forwardSnapshotDrift(Long tunnelId, List<Forward> snapshot, Set<String> lockedHosts) {
+        List<Forward> current = forwardService.list(new QueryWrapper<Forward>().eq("tunnel_id", tunnelId));
+        Set<Long> snapshotIds = snapshot.stream().map(Forward::getId).collect(Collectors.toSet());
+        List<String> appeared = new ArrayList<>();
+        Set<String> unlocked = new LinkedHashSet<>();
+        for (Forward forward : current) {
+            if (!snapshotIds.contains(forward.getId())) {
+                appeared.add("转发" + forward.getId());
+                continue;
+            }
+            for (String host : DdnsDomainGate.targetHosts(forward.getRemoteAddr())) {
+                if (!lockedHosts.contains(host)) unlocked.add(host);
+            }
+        }
+        if (!appeared.isEmpty()) {
+            return R.err("删除过程中新增了" + String.join("，", appeared) + "，本次未删除任何数据，请重试");
+        }
+        if (!unlocked.isEmpty()) {
+            return R.err("转发目标域名在删除过程中被改到锁外（" + String.join("，", unlocked) + "），本次未删除任何数据，请重试");
+        }
+        return null;
     }
 
     /**

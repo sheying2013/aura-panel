@@ -43,6 +43,65 @@ import static org.mockito.Mockito.when;
  */
 class ExpiryPauseConsistencyTest {
 
+    @Test
+    void expiryScanSkipsPermissionBeingRenewedAndRetries() throws Exception {
+        Harness h = new Harness();
+        UserTunnel expired = expiredUserTunnel(5, 7, 300);
+        h.userTunnels = List.of(expired);
+        h.forwards = List.of(forward(21L, 7, 300));
+        when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9003L)));
+        var held = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        Thread renewal = new Thread(() -> {
+            try (var lock = com.admin.common.utils.ResourceLifecycleLocks.acquire(1000,
+                    com.admin.common.utils.ResourceLifecycleLocks.userTunnelKey(5))) {
+                if (lock == null) throw new AssertionError("续期线程未取得锁");
+                held.countDown();
+                if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("等待超时");
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        });
+        renewal.start();
+        try {
+            assertTrue(held.await(2, java.util.concurrent.TimeUnit.SECONDS));
+            h.task.userTunnel();
+            verify(h.forwardService, never()).updateById(any(Forward.class));
+            verify(h.userTunnelService, never()).updateById(any(UserTunnel.class));
+        } finally { release.countDown(); renewal.join(3000); }
+        assertFalse(renewal.isAlive());
+        h.task.userTunnel();
+        verify(h.forwardService).updateById(any(Forward.class));
+        verify(h.userTunnelService).updateById(any(UserTunnel.class));
+    }
+
+    @Test
+    void staleExpiredUserSnapshotDoesNotOverrideRenewal() {
+        Harness h = new Harness();
+        User expired = expiredUser(7L);
+        User renewed = activeUser(7L, System.currentTimeMillis() + 86400000L);
+        h.users = List.of(expired);
+        h.forwards = List.of(forward(11L, 7, 100));
+        when(h.userService.getById(any())).thenReturn(renewed);
+        h.task.user();
+        verify(h.forwardService, never()).updateById(any(Forward.class));
+        verify(h.userService, never()).updateById(any(User.class));
+        assertTrue(h.pausedServices.isEmpty());
+    }
+
+    @Test
+    void staleExpiredUserTunnelSnapshotDoesNotOverrideRenewal() {
+        Harness h = new Harness();
+        UserTunnel expired = expiredUserTunnel(5, 7, 300);
+        UserTunnel renewed = userTunnel(5, 7, 300);
+        renewed.setExpTime(System.currentTimeMillis() + 86400000L);
+        h.userTunnels = List.of(expired);
+        h.forwards = List.of(forward(21L, 7, 300));
+        when(h.userTunnelService.getById(any())).thenReturn(renewed);
+        h.task.userTunnel();
+        verify(h.forwardService, never()).updateById(any(Forward.class));
+        verify(h.userTunnelService, never()).updateById(any(UserTunnel.class));
+        assertTrue(h.pausedServices.isEmpty());
+    }
+
     /** 节点全部在线：每条到期转发都要落库 + 逐入口下发 PauseService。 */
     @Test
     void expiryPausePersistsEveryForwardWhenAllNodesOnline() {
@@ -105,6 +164,65 @@ class ExpiryPauseConsistencyTest {
         int nodeIndex = h.events.indexOf("node:9001:11_7_5");
         assertTrue(dbIndex >= 0, "必须先落库：" + h.events);
         assertTrue(nodeIndex > dbIndex, "落库要先于节点下发，否则中途异常会让节点已停而库里仍 status=1：" + h.events);
+    }
+
+    @Test
+    void busyForwardKeepsExpiredTunnelEligibleForRetry() {
+        Harness h = new Harness();
+        Forward forward = forward(21L, 7, 300);
+        UserTunnel expired = expiredUserTunnel(5, 7, 300);
+        h.userTunnels = List.of(expired);
+        h.forwards = List.of(forward);
+        try (var held = com.admin.common.utils.ForwardWriteLocks.acquire(0, 21L)) {
+            assertNotNull(held);
+            h.task.userTunnel();
+            verify(h.forwardService, never()).updateById(any(Forward.class));
+            verify(h.userTunnelService, never()).updateById(any(UserTunnel.class));
+            assertTrue(h.pausedServices.isEmpty());
+            assertEquals(1, expired.getStatus());
+        }
+        when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9003L)));
+        h.task.userTunnel();
+        verify(h.forwardService).updateById(forward);
+        verify(h.userTunnelService).updateById(expired);
+        assertEquals(0, forward.getStatus());
+        assertEquals(0, expired.getStatus());
+    }
+
+    @Test
+    void busyForwardKeepsExpiredUserEligibleForRetry() {
+        Harness h = new Harness();
+        Forward forward = forward(11L, 7, 100);
+        User expired = expiredUser(7L);
+        h.users = List.of(expired);
+        h.forwards = List.of(forward);
+        try (var held = com.admin.common.utils.ForwardWriteLocks.acquire(0, 11L)) {
+            assertNotNull(held);
+            h.task.user();
+            verify(h.forwardService, never()).updateById(any(Forward.class));
+            verify(h.userService, never()).updateById(any(User.class));
+            assertEquals(1, expired.getStatus());
+        }
+        when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9001L)));
+        h.task.user();
+        verify(h.forwardService).updateById(forward);
+        verify(h.userService).updateById(expired);
+        assertEquals(0, forward.getStatus());
+        assertEquals(0, expired.getStatus());
+    }
+
+    @Test
+    void failedForwardWriteLeavesExpiredUserEligibleAndDoesNotContactNodes() {
+        Harness h = new Harness();
+        Forward forward = forward(11L, 7, 100);
+        User expired = expiredUser(7L);
+        h.users = List.of(expired);
+        h.forwards = List.of(forward);
+        when(h.forwardService.updateById(any(Forward.class))).thenReturn(false);
+        h.task.user();
+        assertEquals(1, expired.getStatus());
+        verify(h.userService, never()).updateById(any(User.class));
+        assertTrue(h.pausedServices.isEmpty());
     }
 
     /** 过期隧道维度同理：落库 + 打 expiry 标记 + 隧道本身停用。 */
@@ -231,6 +349,7 @@ class ExpiryPauseConsistencyTest {
     void flowReportPauseWritesDatabaseBeforeDispatching() {
         FlowHarness h = new FlowHarness();
         Forward forward = forward(71L, 7, 100);
+        when(h.forwardService.getById(forward.getId())).thenReturn(forward);
         when(h.userService.getById(any())).thenReturn(activeUser(7L, System.currentTimeMillis() - 60000L));
         when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9001L), chain(9005L)));
         h.nodeFailures.put(9005L, "节点不在线");
@@ -328,7 +447,13 @@ class ExpiryPauseConsistencyTest {
             };
             when(userService.list(any())).thenAnswer(invocation -> users);
             when(userTunnelService.list(any())).thenAnswer(invocation -> userTunnels);
+            when(userService.getById(any())).thenAnswer(invocation -> users.stream()
+                    .filter(user -> user.getId().equals(invocation.getArgument(0))).findFirst().orElse(null));
+            when(userTunnelService.getById(any())).thenAnswer(invocation -> userTunnels.stream()
+                    .filter(tunnel -> tunnel.getId().equals(invocation.getArgument(0))).findFirst().orElse(null));
             when(forwardService.list(any())).thenAnswer(invocation -> forwards);
+            when(forwardService.getById(any())).thenAnswer(invocation -> forwards.stream()
+                    .filter(forward -> forward.getId().equals(invocation.getArgument(0))).findFirst().orElse(null));
             when(forwardService.updateById(any(Forward.class))).thenAnswer(invocation -> {
                 Forward forward = invocation.getArgument(0);
                 events.add("db:" + forward.getId());

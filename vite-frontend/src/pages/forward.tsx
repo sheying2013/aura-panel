@@ -196,9 +196,6 @@ export default function ForwardPage() {
     results: Array<{ inPort: number; target: string; success: boolean; msg: string }>;
   }>({ current: 0, total: 0, results: [] });
 
-  // 网络质量五维雷达评估状态
-  const [radarModalOpen, setRadarModalOpen] = useState(false);
-  const [radarTargetForward, setRadarTargetForward] = useState<Forward | null>(null);
 
   // 链路安全 ACL 快速审计检测
   const checkAclSecurity = (addrs: string) => {
@@ -299,10 +296,6 @@ export default function ForwardPage() {
     loadData();
   };
 
-  const handleOpenRadar = (forward: Forward) => {
-    setRadarTargetForward(forward);
-    setRadarModalOpen(true);
-  };
   const [exportData, setExportData] = useState('');
   const [exportLoading, setExportLoading] = useState(false);
   const [selectedTunnelForExport, setSelectedTunnelForExport] = useState<number | null>(null);
@@ -1567,21 +1560,6 @@ export default function ForwardPage() {
               }
             >
               诊断
-            </Button>
-            <Button
-              size="sm"
-              variant="flat"
-              color="secondary"
-              onPress={() => handleOpenRadar(forward)}
-              className="flex-1 min-h-8"
-              startContent={
-                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <circle cx="12" cy="12" r="9" strokeWidth="2" />
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M12 3v9l6 6" />
-                </svg>
-              }
-            >
-              雷达
             </Button>
             <Button
               size="sm"
@@ -2938,84 +2916,6 @@ export default function ForwardPage() {
           </ModalContent>
         </Modal>
 
-        {/* 链路五维质量雷达体检模态框 */}
-        <Modal 
-          isOpen={radarModalOpen} 
-          onClose={() => setRadarModalOpen(false)} 
-          size="xl"
-          scrollBehavior="outside"
-          backdrop="blur"
-          placement="center"
-        >
-          <ModalContent>
-            <ModalHeader className="flex flex-col gap-1">
-              <h2 className="text-xl font-bold flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-success" />
-                网络链路五维质量雷达 (Quality Radar)
-              </h2>
-              <p className="text-small text-default-500 font-mono">
-                目标转发: {radarTargetForward?.name} (:{radarTargetForward?.inPort} ➔ {radarTargetForward?.remoteAddr})
-              </p>
-            </ModalHeader>
-            <ModalBody className="pb-6">
-              <div className="space-y-4">
-                {/* 综合评级 Banner */}
-                <div className="p-4 rounded-xl border border-success-500/30 bg-success-500/10 flex items-center justify-between">
-                  <div>
-                    <div className="text-xs text-success font-semibold tracking-wider uppercase">综合质量等级</div>
-                    <div className="text-2xl font-bold text-success-300 mt-0.5">S 级 · 卓越低延迟链路</div>
-                    <div className="text-xs text-default-400 mt-1">
-                      极佳适合电竞级联机加速、超清音视频通话与实时交易系统
-                    </div>
-                  </div>
-                  <div className="w-14 h-14 rounded-2xl bg-success/20 border border-success/30 flex items-center justify-center text-3xl font-black text-success">
-                    S
-                  </div>
-                </div>
-
-                {/* 五维核心指标 Grid */}
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <div className="p-3 rounded-lg border border-divider bg-default-100/50">
-                    <div className="text-[11px] text-default-500">平均往返延迟 (RTT)</div>
-                    <div className="text-lg font-bold font-mono text-primary mt-1">21.4 ms</div>
-                    <div className="text-[10px] text-success mt-0.5">极速响应</div>
-                  </div>
-                  <div className="p-3 rounded-lg border border-divider bg-default-100/50">
-                    <div className="text-[11px] text-default-500">链路抖动 (Jitter)</div>
-                    <div className="text-lg font-bold font-mono text-secondary mt-1">1.2 ms</div>
-                    <div className="text-[10px] text-success mt-0.5">波形极平稳</div>
-                  </div>
-                  <div className="p-3 rounded-lg border border-divider bg-default-100/50">
-                    <div className="text-[11px] text-default-500">丢包率 (Packet Loss)</div>
-                    <div className="text-lg font-bold font-mono text-success mt-1">0.00 %</div>
-                    <div className="text-[10px] text-success mt-0.5">零丢包传输</div>
-                  </div>
-                  <div className="p-3 rounded-lg border border-divider bg-default-100/50">
-                    <div className="text-[11px] text-default-500">服务可用性 (Uptime)</div>
-                    <div className="text-lg font-bold font-mono text-warning mt-1">99.98 %</div>
-                    <div className="text-[10px] text-success mt-0.5">高可靠就绪</div>
-                  </div>
-                </div>
-
-                {/* 智能调度与故障自愈提示 */}
-                <div className="p-3 rounded-lg border border-divider bg-content1 text-xs space-y-1.5">
-                  <div className="font-semibold text-foreground flex items-center gap-1.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-primary" />
-                    底层 Rust 智能调度引擎状态
-                  </div>
-                  <div className="text-default-500 leading-relaxed font-mono">
-                    策略引擎: 平滑加权轮询 (SWRR) + 令牌桶流量整形就绪。三态自愈熔断器处于 [Closed: 正常放行] 状态。
-                  </div>
-                </div>
-              </div>
-            </ModalBody>
-            <ModalFooter>
-              <Button variant="light" onPress={() => setRadarModalOpen(false)}>
-                完成
-              </Button>
-            </ModalFooter>
-          </ModalContent>
-        </Modal>
       </div>
     
   );

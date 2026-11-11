@@ -2,6 +2,7 @@ package com.admin.common.utils;
 
 import cn.hutool.core.util.StrUtil;
 import com.admin.common.dto.GostDto;
+import com.admin.ddns.DdnsTargetRenderer;
 import com.admin.entity.*;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
@@ -238,7 +239,17 @@ public class GostUtil {
     }
 
     public static GostDto AddAndUpdateService(String name, Integer limiter, Node node, Forward forward, ForwardPort forwardPort, Tunnel tunnel, String meth) {
-        GostDto gostDto = WebSocketServer.send_msg(node.getId(), buildForwardServices(name, limiter, node, forward, forwardPort, tunnel), meth);
+        return AddAndUpdateService(name, limiter, node, forward, forwardPort, tunnel, null, meth);
+    }
+
+    /**
+     * 显式给定本次要下发的 target 列表：DDNS 切换窗口内用新地址、回滚窗口内用旧地址，
+     * 都不去读注册表（注册表此时仍是已确认的旧值，读它等于把节点改回去）。
+     */
+    public static GostDto AddAndUpdateService(String name, Integer limiter, Node node, Forward forward, ForwardPort forwardPort,
+                                             Tunnel tunnel, List<String> renderedTargets, String meth) {
+        GostDto gostDto = WebSocketServer.send_msg(node.getId(),
+                buildForwardServices(name, limiter, node, forward, forwardPort, tunnel, renderedTargets), meth);
         if (gostDto.getMsg().contains("exists")){
             gostDto.setMsg("OK");
         }
@@ -250,7 +261,13 @@ public class GostUtil {
      * 不能证明其配置与本次下发一致，也不能算作本次创建成功。
      */
     public static GostDto CreateForwardService(String name, Integer limiter, Node node, Forward forward, ForwardPort forwardPort, Tunnel tunnel) {
-        return WebSocketServer.send_msg(node.getId(), buildForwardServices(name, limiter, node, forward, forwardPort, tunnel), "AddService");
+        return CreateForwardService(name, limiter, node, forward, forwardPort, tunnel, null);
+    }
+
+    public static GostDto CreateForwardService(String name, Integer limiter, Node node, Forward forward, ForwardPort forwardPort,
+                                              Tunnel tunnel, List<String> renderedTargets) {
+        return WebSocketServer.send_msg(node.getId(),
+                buildForwardServices(name, limiter, node, forward, forwardPort, tunnel, renderedTargets), "AddService");
     }
 
     /**
@@ -259,22 +276,38 @@ public class GostUtil {
      */
     public static GostDto CreateSingleForwardService(String name, Integer limiter, Node node, Forward forward,
                                                      ForwardPort forwardPort, Tunnel tunnel, String protocol) {
+        return CreateSingleForwardService(name, limiter, node, forward, forwardPort, tunnel, protocol, null);
+    }
+
+    public static GostDto CreateSingleForwardService(String name, Integer limiter, Node node, Forward forward,
+                                                     ForwardPort forwardPort, Tunnel tunnel, String protocol,
+                                                     List<String> renderedTargets) {
         JSONArray services = new JSONArray();
-        services.add(buildForwardService(name, limiter, node, forward, forwardPort, tunnel, protocol));
+        services.add(buildForwardService(name, limiter, node, forward, forwardPort, tunnel, protocol, renderedTargets));
         return WebSocketServer.send_msg(node.getId(), services, "AddService");
     }
 
-    private static JSONArray buildForwardServices(String name, Integer limiter, Node node, Forward forward, ForwardPort forwardPort, Tunnel tunnel) {
+    private static JSONArray buildForwardServices(String name, Integer limiter, Node node, Forward forward,
+                                                  ForwardPort forwardPort, Tunnel tunnel, List<String> renderedTargets) {
         JSONArray services = new JSONArray();
         String[] protocols = {"tcp", "udp"};
         for (String protocol : protocols) {
-            services.add(buildForwardService(name, limiter, node, forward, forwardPort, tunnel, protocol));
+            services.add(buildForwardService(name, limiter, node, forward, forwardPort, tunnel, protocol, renderedTargets));
         }
         return services;
     }
 
     private static JSONObject buildForwardService(String name, Integer limiter, Node node, Forward forward,
                                                  ForwardPort forwardPort, Tunnel tunnel, String protocol) {
+        return buildForwardService(name, limiter, node, forward, forwardPort, tunnel, protocol, null);
+    }
+
+    /**
+     * @param renderedTargets 非空时按它下发（DDNS 切换窗口），空则按注册表渲染 remoteAddr（老口径）
+     */
+    private static JSONObject buildForwardService(String name, Integer limiter, Node node, Forward forward,
+                                                 ForwardPort forwardPort, Tunnel tunnel, String protocol,
+                                                 List<String> renderedTargets) {
         // Fail-Closed：tunnel.type 决定要不要挂 chains_<tid>。历史行 type 可能为 NULL，
         // 若当成直连下发，本该走中继加密的流量会在入口节点直接明文连目标（round44 QA 裁决）。
         // 这类数据只能拦下来报错，不能猜，也不能静默降级。
@@ -314,7 +347,9 @@ public class GostUtil {
         JSONObject listener = createListener(protocol);
         service.put("listener", listener);
 
-        JSONObject forwarder = createForwarder(forward.getRemoteAddr(), forward.getStrategy());
+        JSONObject forwarder = renderedTargets == null || renderedTargets.isEmpty()
+                ? createForwarder(forward.getRemoteAddr(), forward.getStrategy())
+                : createForwarder(renderedTargets, forward.getRemoteAddr(), forward.getStrategy());
         service.put("forwarder", forwarder);
         return service;
     }
@@ -502,20 +537,45 @@ public class GostUtil {
         return listener;
     }
 
-    private static JSONObject createForwarder(String remoteAddr, String strategy) {
-        JSONObject forwarder = new JSONObject();
-        JSONArray nodes = new JSONArray();
-
-        String[] split = remoteAddr.split(",");
-        int num = 1;
-        for (String addr : split) {
+    /**
+     * 把 remoteAddr 渲染成真正下发给 GOST 的 target 列表。
+     *
+     * <p>已注册 DDNS 域名的 host 会替换成当前主地址；未注册的域名、IP 和端口原样保留。
+     * createForwarder 与 ForwardServiceImpl.expectedServiceDigest 必须共用这一处，
+     * 否则下发改成 IP、摘要仍按域名算，节点每上报一次都会被判成漂移并删建服务。
+     */
+    public static List<String> renderForwardTargets(String remoteAddr) {
+        List<String> targets = new ArrayList<>();
+        if (remoteAddr == null) {
+            return targets;
+        }
+        for (String addr : remoteAddr.split(",")) {
             String trimmed = addr == null ? "" : addr.trim();
             if (trimmed.isEmpty()) {
                 continue; // 逗号后面多打的空格/多留的逗号不该下发成空目标
             }
+            targets.add(DdnsTargetRenderer.render(trimmed));
+        }
+        return targets;
+    }
+
+    private static JSONObject createForwarder(String remoteAddr, String strategy) {
+        return createForwarder(renderForwardTargets(remoteAddr), remoteAddr, strategy);
+    }
+
+    /**
+     * @param targets     已经渲染好的目标列表（DDNS 切换窗口显式传入，不再经过注册表）
+     * @param rawRemoteAddr 列表为空时的兜底原值
+     */
+    private static JSONObject createForwarder(List<String> targets, String rawRemoteAddr, String strategy) {
+        JSONObject forwarder = new JSONObject();
+        JSONArray nodes = new JSONArray();
+
+        int num = 1;
+        for (String rendered : targets) {
             JSONObject node = new JSONObject();
             node.put("name", "node_" + num);
-            node.put("addr", trimmed);
+            node.put("addr", rendered);
             nodes.add(node);
             num++;
         }
@@ -524,7 +584,7 @@ public class GostUtil {
             // 全是空白时按原样兜一个：空 nodes 会被 gost 直接拒掉，整条服务都下发不出去
             JSONObject node = new JSONObject();
             node.put("name", "node_1");
-            node.put("addr", remoteAddr);
+            node.put("addr", rawRemoteAddr);
             nodes.add(node);
         }
 

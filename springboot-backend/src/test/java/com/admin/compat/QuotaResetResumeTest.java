@@ -100,6 +100,11 @@ class QuotaResetResumeTest {
         ReflectionTestUtils.setField(forwardService, "chainTunnelService", chainTunnelService);
 
         when(forwardMapper.selectList(any())).thenReturn(List.of(forward(0)));
+        when(forwardMapper.selectById(any())).thenAnswer(invocation -> {
+            List<Forward> rows = forwardMapper.selectList(null);
+            return rows == null ? null : rows.stream()
+                    .filter(f -> f.getId().equals(invocation.getArgument(0))).findFirst().orElse(null);
+        });
         when(forwardMapper.updateById(any())).thenReturn(1);
         when(userService.getById(any())).thenReturn(user(1, null, 1L, 0L));
         when(userTunnelService.getOne(any())).thenReturn(userTunnel(1, null, 5L, 0L, 0L));
@@ -184,6 +189,23 @@ class QuotaResetResumeTest {
 
         assertTrue(notes.isEmpty(), "实际：" + notes);
         verify(forwardMapper, never()).updateById(any());
+    }
+
+    @Test
+    void noResumeWhenOwnerQuotaChangesAfterCandidateSelection() throws Exception {
+        when(userService.getById(any())).thenReturn(user(1, null, 1L, 0L), user(1, null, 1L, GB() + 1));
+        forwardService.resumeQuotaPausedForUser(USER_ID, true, NOW);
+        verify(forwardMapper, never()).updateById(any());
+        assertTrue(resumedServiceNamesQuiet(NODE_ID).isEmpty());
+    }
+
+    @Test
+    void noResumeWhenTunnelExpiresAfterCandidateSelection() throws Exception {
+        when(userTunnelService.getOne(any())).thenReturn(
+                userTunnel(1, null, 5L, 0L, 0L), userTunnel(0, null, 5L, 0L, 0L));
+        forwardService.resumeQuotaPausedForUser(USER_ID, true, NOW);
+        verify(forwardMapper, never()).updateById(any());
+        assertTrue(resumedServiceNamesQuiet(NODE_ID).isEmpty());
     }
 
     private static final long NOW = 1_800_000_000_000L;

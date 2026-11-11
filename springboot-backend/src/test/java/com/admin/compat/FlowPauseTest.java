@@ -44,7 +44,7 @@ class FlowPauseTest {
         when(h.userTunnelService.getOne(any())).thenReturn(userTunnel(5, 7, 100), userTunnel(9, 7, 200));
         when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9001L)), List.of(chain(9002L)));
 
-        h.controller.pauseService(List.of(first, second));
+        h.pause(List.of(first, second));
 
         assertEquals(List.of("9001:11_7_5", "9002:12_7_9"), h.pausedServices);
         assertEquals(0, first.getStatus());
@@ -67,7 +67,7 @@ class FlowPauseTest {
         when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9001L), chain(9005L)), List.of(chain(9002L)));
         h.nodeFailures.put(9005L, "节点不在线");
 
-        h.controller.pauseService(List.of(first, second));
+        h.pause(List.of(first, second));
 
         assertEquals(List.of("9001:11_7_5", "9005:11_7_5", "9002:12_7_9"), h.pausedServices);
         assertEquals(0, first.getStatus());
@@ -85,7 +85,7 @@ class FlowPauseTest {
         when(h.userService.getById(any())).thenReturn(user(3, 0));
         when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9003L)));
 
-        h.controller.pauseService(List.of(forward));
+        h.pause(List.of(forward));
 
         assertEquals(List.of("9003:21_3_0"), h.pausedServices);
         assertEquals(0, forward.getStatus());
@@ -99,7 +99,7 @@ class FlowPauseTest {
         when(h.userService.getById(any())).thenReturn(user(3, 0));
         when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9003L)));
 
-        h.controller.pauseService(List.of(forward));
+        h.pause(List.of(forward));
 
         assertEquals(List.of("9003:22_3_0"), h.pausedServices);
         verify(h.userTunnelService, never()).getOne(any());
@@ -113,7 +113,7 @@ class FlowPauseTest {
         when(h.userService.getById(any())).thenReturn(user(8, 2));
         when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9004L)));
 
-        h.controller.pauseService(List.of(forward));
+        h.pause(List.of(forward));
 
         assertTrue(h.pausedServices.isEmpty());
         assertEquals(1, forward.getStatus());
@@ -127,7 +127,7 @@ class FlowPauseTest {
         when(h.userTunnelService.getOne(any())).thenReturn(userTunnel(5, 7, 100));
         when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9001L)));
 
-        h.controller.pauseService(List.of(forward), PauseReason.QUOTA);
+        h.pause(List.of(forward), PauseReason.QUOTA);
 
         assertEquals(PauseReason.QUOTA, forward.getPauseReason());
         verify(h.forwardService).updateById(forward);
@@ -140,7 +140,7 @@ class FlowPauseTest {
         when(h.userTunnelService.getOne(any())).thenReturn(userTunnel(5, 7, 100));
         when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9001L)));
 
-        h.controller.pauseService(List.of(forward), PauseReason.EXPIRY);
+        h.pause(List.of(forward), PauseReason.EXPIRY);
 
         assertEquals(PauseReason.EXPIRY, forward.getPauseReason());
     }
@@ -152,9 +152,32 @@ class FlowPauseTest {
         when(h.userTunnelService.getOne(any())).thenReturn(userTunnel(5, 7, 100));
         when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9001L)));
 
-        h.controller.pauseService(List.of(forward));
+        h.pause(List.of(forward));
 
         assertEquals(PauseReason.QUOTA, forward.getPauseReason());
+    }
+
+    @Test
+    void busyForwardIsNotPausedUsingStaleSnapshot() {
+        Harness h = new Harness();
+        Forward forward = forward(55L, 7, 100);
+        try (var held = com.admin.common.utils.ForwardWriteLocks.acquire(0, 55L)) {
+            assertTrue(held != null);
+            h.pause(List.of(forward));
+            verify(h.forwardService, never()).updateById(any(Forward.class));
+            assertTrue(h.pausedServices.isEmpty());
+        }
+    }
+
+    @Test
+    void databaseWriteFailureDoesNotPauseNode() {
+        Harness h = new Harness();
+        Forward forward = forward(56L, 7, 100);
+        when(h.userTunnelService.getOne(any())).thenReturn(userTunnel(5, 7, 100));
+        when(h.chainTunnelService.list(any())).thenReturn(List.of(chain(9001L)));
+        when(h.forwardService.updateById(any(Forward.class))).thenReturn(false);
+        h.pause(List.of(forward));
+        assertTrue(h.pausedServices.isEmpty());
     }
 
     private static Forward forward(long id, int userId, int tunnelId) {
@@ -201,7 +224,22 @@ class FlowPauseTest {
         private final Map<Long, String> nodeFailures = new HashMap<>();
         private final FlowController controller;
 
+        private void pause(List<Forward> rows) {
+            register(rows);
+            controller.pauseService(rows);
+        }
+
+        private void pause(List<Forward> rows, String reason) {
+            register(rows);
+            controller.pauseService(rows, reason);
+        }
+
+        private void register(List<Forward> rows) {
+            for (Forward row : rows) when(forwardService.getById(row.getId())).thenReturn(row);
+        }
+
         private Harness() {
+            when(forwardService.updateById(any(Forward.class))).thenReturn(true);
             when(userService.getById(any())).thenReturn(user(7, 2));
             controller = new FlowController() {
                 @Override

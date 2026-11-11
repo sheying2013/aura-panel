@@ -200,9 +200,11 @@ class LimiterDriftResyncTest {
         assertEquals("AddLimiters", otherMessages.get(0).getString("type"));
         assertEquals("DeleteLimiters", otherMessages.get(1).getString("type"));
 
+        // 另一节点的任务完成不代表此节点的异步限速对账已经开始；等本节点实际消息到达。
+        List<JSONObject> failedNodeMessages = awaitMessages(NODE, 2);
         awaitSweepsDone();
-        assertEquals(2, messages(NODE).size(),
-                "失败节点也把命令发出去了（补齐被拒 + 孤儿回收），不该静默重试或补发：" + typeNames(messages(NODE)));
+        assertEquals(2, failedNodeMessages.size(),
+                "失败节点也把命令发出去了（补齐被拒 + 孤儿回收），不该静默重试或补发：" + typeNames(failedNodeMessages));
     }
 
     // ========== 6) 同一次上报里同一个 limiter 只处理一次 ==========

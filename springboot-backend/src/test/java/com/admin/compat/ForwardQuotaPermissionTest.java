@@ -45,6 +45,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -219,14 +220,17 @@ class ForwardQuotaPermissionTest {
     // ========== 管理员路径 ==========
 
     @Test
-    void adminIgnoresQuotaAndUserLookup() {
+    void adminSkipsQuotaButStillReReadsAccountRow() {
         authenticate(0, "admin");
+        User admin = user();
+        admin.setRoleId(0);
+        currentUserEntity = admin;
 
         R result = forwardService.updateForward(updateDto());
 
         assertEquals(0, result.getCode(), result.getMsg());
         assertEquals(List.of(), countSqlSegments, "管理员不做配额查询");
-        verify(userService, never()).getById(any());
+        verify(userService, atLeastOnce()).getById(any());
         verify(forwardMapper).updateById(any(Forward.class));
     }
 

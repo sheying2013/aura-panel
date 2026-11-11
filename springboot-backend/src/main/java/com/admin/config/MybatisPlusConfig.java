@@ -10,7 +10,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
-@MapperScan("com.admin.mapper")
+@MapperScan({"com.admin.mapper", "com.admin.ddns.mapper"})
 public class MybatisPlusConfig {
 
     @Bean

@@ -2,6 +2,8 @@ package com.admin.common.task;
 
 import com.admin.common.dto.GostDto;
 import com.admin.common.utils.GostUtil;
+import com.admin.common.utils.ForwardWriteLocks;
+import com.admin.common.utils.ResourceLifecycleLocks;
 import com.admin.common.utils.PauseReason;
 import com.admin.common.utils.QuotaResume;
 import com.admin.entity.*;
@@ -239,16 +241,31 @@ public class ResetFlowAsync {
     public void user(){
         // 查询过期用户
         List<User> user_list = userService.list(new QueryWrapper<User>().ne("role_id", 0).eq("status", 1).isNotNull("exp_time").lt("exp_time", new Date().getTime()));
-        for (User user : user_list) {
+        for (User snapshot : user_list) {
+            if (snapshot == null || snapshot.getId() == null) continue;
+            ResourceLifecycleLocks.Lease ownerLease = ResourceLifecycleLocks.acquire(
+                    0L, ResourceLifecycleLocks.userKey(snapshot.getId()));
+            if (ownerLease == null) continue; // 正在续期，下一轮重新查询
+            try {
+            User user = userService.getById(snapshot.getId());
+            if (user == null || !Objects.equals(user.getStatus(), 1)
+                    || Objects.equals(user.getRoleId(), 0) || user.getExpTime() == null
+                    || user.getExpTime() >= System.currentTimeMillis()) continue;
             // 查询对应转发
             List<Forward> forwardList = forwardService.list(new QueryWrapper<Forward>().eq("user_id", user.getId()).eq("status", 1));
+            boolean allPersisted = true;
             for (Forward forward : forwardList) {
-
                 UserTunnel userTunnel = userTunnelService.getOne(new QueryWrapper<UserTunnel>().eq("user_id", forward.getUserId()).eq("tunnel_id", forward.getTunnelId()));
-                pauseForwardForExpiry(forward, userTunnel);
+                allPersisted &= pauseForwardForExpiry(forward, userTunnel);
             }
-            user.setStatus(0);
-            userService.updateById(user);
+            // 锁忙或写库失败时继续保留 status=1，使下次到期扫描能重新处理。
+            if (allPersisted) {
+                user.setStatus(0);
+                userService.updateById(user);
+            }
+            } finally {
+                ownerLease.close();
+            }
         }
     }
 
@@ -257,16 +274,27 @@ public class ResetFlowAsync {
         // 查询过期隧道
         List<UserTunnel> user_tunnel_list = userTunnelService.list(new QueryWrapper<UserTunnel>().eq("status", 1).isNotNull("exp_time").lt("exp_time", new Date().getTime()));
         // 查询对应转发
-        for (UserTunnel userTunnel : user_tunnel_list) {
+        for (UserTunnel snapshot : user_tunnel_list) {
+            if (snapshot == null || snapshot.getId() == null) continue;
+            ResourceLifecycleLocks.Lease permissionLease = ResourceLifecycleLocks.acquire(
+                    0L, ResourceLifecycleLocks.userTunnelKey(snapshot.getId()));
+            if (permissionLease == null) continue; // 权限正在续期，下一轮再查
+            try {
+            UserTunnel userTunnel = userTunnelService.getById(snapshot.getId());
+            if (userTunnel == null || !Objects.equals(userTunnel.getStatus(), 1)
+                    || userTunnel.getExpTime() == null || userTunnel.getExpTime() >= System.currentTimeMillis()) continue;
             List<Forward> forwardList = forwardService.list(new QueryWrapper<Forward>().eq("tunnel_id", userTunnel.getTunnelId()).eq("user_id", userTunnel.getUserId()).eq("status", 1));
+            boolean allPersisted = true;
             for (Forward forward : forwardList) {
-
-                pauseForwardForExpiry(forward, userTunnel);
+                allPersisted &= pauseForwardForExpiry(forward, userTunnel);
             }
-
-
-            userTunnel.setStatus(0);
-            userTunnelService.updateById(userTunnel);
+            if (allPersisted) {
+                userTunnel.setStatus(0);
+                userTunnelService.updateById(userTunnel);
+            }
+            } finally {
+                permissionLease.close();
+            }
         }
     }
 
@@ -315,12 +343,26 @@ public class ResetFlowAsync {
      *
      * @param userTunnel 该转发对应的用户隧道，可能为 null；服务名按全局口径退化为 0
      */
-    private void pauseForwardForExpiry(Forward forward, UserTunnel userTunnel) {
+    private boolean pauseForwardForExpiry(Forward snapshot, UserTunnel userTunnel) {
+        if (snapshot == null || snapshot.getId() == null) return false;
+        ForwardWriteLocks.Lease lease = ForwardWriteLocks.tryAcquire(snapshot.getId());
+        if (lease == null) {
+            log.warn("到期转发 {} 正在修改，下一轮继续处理", snapshot.getId());
+            return false;
+        }
+        try {
+        Forward forward = forwardService.getById(snapshot.getId());
+        if (forward == null || !Objects.equals(forward.getStatus(), 1)) return true;
+        if (!Objects.equals(forward.getUserId(), snapshot.getUserId())
+                || !Objects.equals(forward.getTunnelId(), snapshot.getTunnelId())) return false;
         forward.setStatus(0);
         // round19：到期自动暂停要留痕，否则续费后无人知道这些转发是被到期停的
         forward.setPauseReason(PauseReason.EXPIRY);
         forward.setUpdatedTime(System.currentTimeMillis());
-        forwardService.updateById(forward);
+        if (!forwardService.updateById(forward)) {
+            log.warn("到期转发 {} 暂停状态写入失败，下一轮重试", forward.getId());
+            return false;
+        }
 
         int userTunnelId = (userTunnel != null && userTunnel.getId() != null) ? userTunnel.getId() : 0;
         String name = buildServiceName(forward.getId(), forward.getUserId(), userTunnelId);
@@ -338,6 +380,13 @@ public class ResetFlowAsync {
         if (!notes.isEmpty()) {
             log.warn("转发 {} 已按到期暂停落库，{} 个入口节点未确认：{}，等待节点重连后补偿",
                     forward.getId(), notes.size(), String.join("；", notes));
+        }
+        return true;
+        } catch (RuntimeException e) {
+            log.warn("到期转发 {} 暂停失败，下一轮重试", snapshot.getId(), e);
+            return false;
+        } finally {
+            lease.close();
         }
     }
 

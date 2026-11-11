@@ -27,10 +27,10 @@ Designed for managing multi-server traffic relay, port mapping, and network topo
 - **Protocols**: Supports TCP and UDP port forwarding, with simultaneous TCP+UDP dual-stack listening on the same port.
 - **Multi-Hop Relay**: Flexible multi-stage relay chains (`Ingress -> Relay -> Egress`) with encrypted transport.
 - **Port Multiplexing**: Single-port multiplexing to optimize public IP/port utilization.
-- **Node Management**: Distributed Agent node connectivity with real-time heartbeat and health monitoring.
+- **Node Management**: Agent connectivity and an administrator dashboard health summary. The control channel is probed every 12 hours by default; results older than 24 hours are shown as unknown. This does not verify forwarding traffic.
 - **Traffic Accounting & Rate Limiting**: Real-time ingress/egress bandwidth and volume tracking with user and tunnel quota enforcement.
-- **Dynamic DNS (DDNS)**: Automatic domain resolution tracking and target IP reload.
-- **Load Balancing & Failover**: Smooth Weighted Round-Robin (SWRR), least-active-connections scheduling, and standby failover.
+- **Dynamic DNS (DDNS)**: Administrators can manage target domains and apply address changes to the affected ingress nodes. Unconfirmed updates or rollbacks are reported; listener recreation can interrupt traffic.
+- **Target Selection**: Round-robin, random, and ordered selection strategies.
 - **Access Control**: IP CIDR black/whitelisting and port filtering.
 - **Rule Orchestration & Backup**: Batch port range mapping, rule toggling, and configuration backup/export (JSON, TXT batch, and CSV formats).
 - **Web Console**: Management interface for nodes, tunnels, forwarding rules, and user access control.
@@ -109,6 +109,8 @@ docker compose up -d
 - Default Password: `admin`
 
 > Please change the default password after your first login.
+
+Node health checks are scheduled independently of page refreshes. An older agent may rewrite `gost.json` when receiving a probe; an agent containing the probe fix no longer performs that write.
 
 ---
 

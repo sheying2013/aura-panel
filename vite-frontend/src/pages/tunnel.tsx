@@ -546,6 +546,35 @@ export default function TunnelPage() {
     return { text: '😵 很差', color: 'danger' };
   };
 
+  // 节点真实名称：直接用 /node/list 已返回的名称，查不到就退回 #id，不编造
+  const getNodeName = (nodeId: number): string => {
+    if (nodeId === -1) return '未选择';
+
+    return nodes.find(node => node.id === nodeId)?.name || `#${nodeId}`;
+  };
+
+  const renderNodeNames = (items: ChainTunnel[]) => {
+    const visible = items.filter(ct => ct.nodeId !== -1);
+
+    if (visible.length === 0) {
+      return <span className="text-[11px] leading-5 text-default-400">—</span>;
+    }
+
+    return (
+      <div className="flex flex-1 flex-wrap gap-1 min-w-0">
+        {visible.map((ct, index) => (
+          <span
+            key={`${ct.nodeId}-${index}`}
+            className="max-w-full truncate rounded bg-default-100 px-1.5 py-0.5 text-[11px] leading-4 text-default-700 dark:bg-default-100/40"
+            title={getNodeName(ct.nodeId)}
+          >
+            {getNodeName(ct.nodeId)}
+          </span>
+        ))}
+      </div>
+    );
+  };
+
   if (loading) {
     return (
       
@@ -653,6 +682,24 @@ export default function TunnelPage() {
                         </div>
 
                    
+                      </div>
+
+                      {/* 入口 / 中继 / 出口 真实节点名称 */}
+                      <div className="space-y-1 rounded bg-default-50/60 dark:bg-default-100/10 px-2 py-1.5">
+                        <div className="flex items-start gap-1.5">
+                          <span className="w-10 shrink-0 text-[11px] leading-5 font-medium text-primary-600 dark:text-primary-400">入口</span>
+                          {renderNodeNames(tunnel.inNodeId || [])}
+                        </div>
+                        {tunnel.type === 2 && (tunnel.chainNodes || []).map((group, hopIndex) => (
+                          <div key={hopIndex} className="flex items-start gap-1.5">
+                            <span className="w-10 shrink-0 text-[11px] leading-5 font-medium text-secondary-600 dark:text-secondary-400">中继{hopIndex + 1}</span>
+                            {renderNodeNames(group)}
+                          </div>
+                        ))}
+                        <div className="flex items-start gap-1.5">
+                          <span className="w-10 shrink-0 text-[11px] leading-5 font-medium text-success-600 dark:text-success-400">出口</span>
+                          {renderNodeNames(tunnel.type === 2 ? (tunnel.outNodeId || []) : (tunnel.inNodeId || []))}
+                        </div>
                       </div>
 
                       {/* 流量配置 */}

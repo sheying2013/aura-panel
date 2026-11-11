@@ -12,9 +12,12 @@ import com.admin.common.utils.IpUtils;
 import com.admin.common.utils.JwtUtil;
 import com.admin.common.utils.Md5Util;
 import com.admin.common.utils.QuotaResume;
+import com.admin.common.utils.ResourceLifecycleLocks;
 import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
+import com.admin.ddns.DdnsDomainGate;
+import com.admin.ddns.DdnsTargetRenderer;
 import com.admin.entity.*;
 import com.admin.mapper.UserMapper;
 import com.admin.service.*;
@@ -32,8 +35,10 @@ import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 
@@ -208,6 +213,17 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         if (userUpdateDto == null || userUpdateDto.getId() == null) {
             return R.err("用户ID不能为空");
         }
+        ResourceLifecycleLocks.Lease lease = ResourceLifecycleLocks.acquire(
+                ResourceLifecycleLocks.CREATE_WAIT_MILLIS, ResourceLifecycleLocks.userKey(userUpdateDto.getId()));
+        if (lease == null) return R.err("该用户正在修改或删除，请稍后重试");
+        try {
+            return updateUserLocked(userUpdateDto);
+        } finally {
+            lease.close();
+        }
+    }
+
+    private R updateUserLocked(UserUpdateDto userUpdateDto) {
         User user = this.getById(userUpdateDto.getId());
         if (user == null) return R.err("用户不存在");
         if (Integer.valueOf(0).equals(user.getRoleId())) return R.err("请不要作死");
@@ -268,19 +284,116 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         if (id == null) {
             return R.err("用户ID不能为空");
         }
+        // 生命周期锁（单 JVM）：createForward 会先落 forward 行、再逐入口节点下发服务，而本方法按 user_id
+        // 把这一批转发整体 purge 掉。两道漂移检查只看得见「读快照之后长出来的库行」，看不见「检查通过之后、
+        // purge 之前才插入的行」——那条转发的行被删掉，节点服务却可能刚建完，从此没有任何记录能对上。
+        // 锁与 createForward 的属主用户键相同，覆盖「校验 → 落库 → 下发」与「读快照 → 删行 → 节点清理」。
+        ResourceLifecycleLocks.Lease lifecycleLease = ResourceLifecycleLocks.acquire(
+                ResourceLifecycleLocks.DELETE_WAIT_MILLIS, ResourceLifecycleLocks.userKey(id));
+        if (lifecycleLease == null) {
+            return R.err("该用户正在被创建/删除，本次未删除任何数据，请稍后重试");
+        }
+        try {
+            return deleteUserLocked(id);
+        } finally {
+            lifecycleLease.close();
+        }
+    }
+
+    /** 生命周期锁内的用户删除：属主校验、转发快照、DDNS 凭证与级联 purge 都在同一临界区里。 */
+    private R deleteUserLocked(Long id) {
+        // 持锁后重读：等锁期间账号可能已被另一个删除请求清掉，按旧结论继续只是把不存在的东西再删一遍
         User user = this.getById(id);
         if (user == null) return R.err("用户不存在");
         if (Integer.valueOf(0).equals(user.getRoleId())) return R.err("请不要作死");
         List<Forward> forwardList = forwardService.list(new QueryWrapper<Forward>().eq("user_id", id));
         // 先取 id：deleteForward 成功会把 forward 行删掉，之后再查就凑不齐 forward_id 了
         List<Long> forwardIds = forwardList.stream().map(Forward::getId).collect(Collectors.toList());
-        for (Forward forward : forwardList) {
-            forwardService.deleteForward(forward.getId());
+        // deleteForward 会往每条转发的目标域名下发 DeleteService，DDNS 切换同时在同一批域名上改地址：
+        // 两边必须互斥到级联事务返回，否则切换写进去的新地址会落在一条已经没人记得的服务上。
+        // 一次取全部域名的共享凭证（闸门内部按排序键加锁，逐条取锁会与切换线程交叉成环），
+        // 拿不到就一行都不删。deleteForward 内部对同一域名再取读锁与本线程重入，直接成功。
+        Set<String> lockedHosts = lockedTargets(forwardList);
+        DdnsDomainGate.Lease ddnsLease = DdnsTargetRenderer.beginDispatch(dispatchTargets(forwardList));
+        if (ddnsLease == null) return R.err(ddnsBusyMessage(lockedHosts));
+        try {
+            // 快照是加锁之前读的：这期间新增的转发、被改到别的域名的转发都不在这份锁里
+            R drift = forwardSnapshotDrift(id, forwardList, lockedHosts);
+            if (drift != null) return drift;
+
+            List<String> ddnsBlocked = new ArrayList<>();
+            for (Forward forward : forwardList) {
+                R result = forwardService.deleteForward(forward.getId());
+                if (result != null && result.getCode() == 0) continue;
+                // DDNS 目标上的转发被拒：它可能刚拿到新地址，记录一删就再没人对账，必须整个停下来；
+                // 非 DDNS 转发维持原语义（端口行孤儿比节点残留更不可恢复）。
+                if (!DdnsDomainGate.targetHosts(forward.getRemoteAddr()).isEmpty()) {
+                    ddnsBlocked.add("转发" + forward.getId() + "(" + (result == null ? "无返回" : result.getMsg()) + ")");
+                }
+            }
+            if (!ddnsBlocked.isEmpty()) {
+                log.warn("用户 {} 删除中止：DDNS 目标转发未删除 {}", id, String.join("，", ddnsBlocked));
+                return R.err("DDNS 目标转发未能删除，已中止级联清理以保留记录：" + String.join("，", ddnsBlocked));
+            }
+
+            // 落库前再挡一次：这期间新长出来的转发，目标域名不在我们手里的锁上
+            drift = forwardSnapshotDrift(id, forwardList, lockedHosts);
+            if (drift != null) return drift;
+
+            // deleteForward 在节点侧失败时会跳过库清理（只回错误、库不动），这些转发的 forward_port
+            // 只能按 forward_id 在这里兜住；只删 forward 表会把端口行留成孤儿
+            cascadeDeletePurger.purgeUserDatabaseRecords(id, forwardIds);
+            return R.ok();
+        } finally {
+            ddnsLease.close();
         }
-        // deleteForward 在节点侧失败时会跳过库清理（只回错误、库不动），这些转发的 forward_port
-        // 只能按 forward_id 在这里兜住；只删 forward 表会把端口行留成孤儿
-        cascadeDeletePurger.purgeUserDatabaseRecords(id, forwardIds);
-        return R.ok();
+    }
+
+    /** 把所有转发的目标地址拼成一份（与 remote_addr 同格式，逗号分隔），交给闸门一次按域名加锁。 */
+    private static String dispatchTargets(List<Forward> forwards) {
+        StringBuilder merged = new StringBuilder();
+        for (Forward forward : forwards) {
+            String remoteAddr = forward.getRemoteAddr();
+            if (remoteAddr == null || remoteAddr.trim().isEmpty()) continue;
+            if (merged.length() > 0) merged.append(',');
+            merged.append(remoteAddr.trim());
+        }
+        return merged.toString();
+    }
+
+    private static Set<String> lockedTargets(List<Forward> forwards) {
+        return new LinkedHashSet<>(DdnsDomainGate.targetHosts(dispatchTargets(forwards)));
+    }
+
+    private static String ddnsBusyMessage(Set<String> hosts) {
+        return "目标域名正在 DDNS 切换（" + String.join("，", hosts) + "），本次删除未执行，请稍后重试";
+    }
+
+    /**
+     * 持锁后重读转发，确认锁外没有新东西：并发新增的行（目标域名没加锁）、被改到未加锁域名的行。
+     * 命中即整体放弃 —— 按旧快照照样删下去，同样会留下「切换已把新地址写进服务、库行却已删」的残留。
+     */
+    private R forwardSnapshotDrift(Long userId, List<Forward> snapshot, Set<String> lockedHosts) {
+        List<Forward> current = forwardService.list(new QueryWrapper<Forward>().eq("user_id", userId));
+        Set<Long> snapshotIds = snapshot.stream().map(Forward::getId).collect(Collectors.toSet());
+        List<String> appeared = new ArrayList<>();
+        Set<String> unlocked = new LinkedHashSet<>();
+        for (Forward forward : current) {
+            if (!snapshotIds.contains(forward.getId())) {
+                appeared.add("转发" + forward.getId());
+                continue;
+            }
+            for (String host : DdnsDomainGate.targetHosts(forward.getRemoteAddr())) {
+                if (!lockedHosts.contains(host)) unlocked.add(host);
+            }
+        }
+        if (!appeared.isEmpty()) {
+            return R.err("删除过程中新增了" + String.join("，", appeared) + "，本次未删除任何数据，请重试");
+        }
+        if (!unlocked.isEmpty()) {
+            return R.err("转发目标域名在删除过程中被改到锁外（" + String.join("，", unlocked) + "），本次未删除任何数据，请重试");
+        }
+        return null;
     }
 
     @Override
@@ -370,14 +483,31 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         if (resetFlowDto.getType() == null) {
             return R.err("重置类型不能为空");
         }
+        if (resetFlowDto.getType() != 1 && resetFlowDto.getType() != 2) {
+            return R.err("重置类型只能是 1（账号）或 2（隧道）");
+        }
+        String key = resetFlowDto.getType() == 1
+                ? ResourceLifecycleLocks.userKey(resetFlowDto.getId())
+                : ResourceLifecycleLocks.userTunnelKey(resetFlowDto.getId());
+        ResourceLifecycleLocks.Lease lease = ResourceLifecycleLocks.acquire(
+                ResourceLifecycleLocks.CREATE_WAIT_MILLIS, key);
+        if (lease == null) return R.err("账号或隧道权限正在更新，未重置流量，请稍后重试");
+        try {
+            return resetWithLifecycleLock(resetFlowDto);
+        } finally {
+            lease.close();
+        }
+    }
+
+    private R resetWithLifecycleLock(ResetFlowDto resetFlowDto) {
         long now = System.currentTimeMillis();
         if (resetFlowDto.getType() == 1){ // 清零账号流量
             User user = this.getById(resetFlowDto.getId());
             if (user == null) return R.err("用户不存在");
             boolean overQuota = QuotaResume.userOverQuota(user.getFlow(), user.getInFlow(), user.getOutFlow());
-            user.setInFlow(0L);
-            user.setOutFlow(0L);
-            this.updateById(user);
+            // 显式列更新：不得携带旧实体上的角色、续期时间或其他字段。
+            if (!this.update(null, new UpdateWrapper<User>().eq("id", user.getId())
+                    .set("in_flow", 0L).set("out_flow", 0L))) return R.err("账号流量重置失败");
             List<String> notes = forwardService.resumeQuotaPausedForUser(user.getId(), overQuota, now);
             if (!notes.isEmpty()) {
                 log.warn("用户 {} 流量重置后恢复转发，{} 个入口节点未执行：{}",
@@ -388,9 +518,9 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             UserTunnel tunnel = userTunnelService.getById(resetFlowDto.getId());
             if (tunnel == null) return R.err("未找到对应的用户隧道权限记录");
             boolean overQuota = QuotaResume.userTunnelOverQuota(tunnel.getFlow(), tunnel.getInFlow(), tunnel.getOutFlow());
-            tunnel.setInFlow(0L);
-            tunnel.setOutFlow(0L);
-            userTunnelService.updateById(tunnel);
+            // speedId 的 FieldStrategy.IGNORED 会让稀疏实体清空限速，必须仅更新两列。
+            if (!userTunnelService.update(null, new UpdateWrapper<UserTunnel>().eq("id", tunnel.getId())
+                    .set("in_flow", 0L).set("out_flow", 0L))) return R.err("隧道流量重置失败");
             List<String> notes = forwardService.resumeQuotaPausedForUserTunnel(tunnel.getId(), overQuota, now);
             if (!notes.isEmpty()) {
                 log.warn("用户隧道 {} 流量重置后恢复转发，{} 个入口节点未执行：{}",

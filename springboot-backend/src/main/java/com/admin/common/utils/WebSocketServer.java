@@ -4,10 +4,12 @@ package com.admin.common.utils;
 import com.admin.common.dto.GostConfigDto;
 import com.admin.common.dto.GostDto;
 import com.admin.common.task.CheckGostConfigAsync;
+import com.admin.ddns.DdnsTargetRenderer;
 import com.admin.entity.ChainTunnel;
 import com.admin.entity.Forward;
 import com.admin.entity.Node;
 import com.admin.entity.Tunnel;
+import com.admin.entity.User;
 import com.admin.entity.UserTunnel;
 import com.admin.service.ChainTunnelService;
 import com.admin.service.ForwardService;
@@ -16,6 +18,7 @@ import com.admin.service.SpeedLimitService;
 import com.admin.entity.ForwardPort;
 import com.admin.service.ForwardPortService;
 import com.admin.service.TunnelService;
+import com.admin.service.UserService;
 import com.admin.service.UserTunnelService;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.alibaba.fastjson.JSON;
@@ -64,6 +67,9 @@ public class WebSocketServer extends TextWebSocketHandler {
 
     @Resource
     UserTunnelService userTunnelService;
+
+    @Resource
+    UserService userService;
 
     @Resource
     TunnelService tunnelService;
@@ -440,7 +446,7 @@ public class WebSocketServer extends TextWebSocketHandler {
                         if (session == null || !session.isOpen()) {
                             return; // 已经离线，推过去的命令只会超时
                         }
-                        reconcileNodeState(nodeId);
+                        reconcileNodeState(nodeId, session, CONNECT_RECONCILE_RETRIES);
                     } catch (Exception e) {
                         log.warn("节点 {} 连接对账调度异常: {}", nodeId, e.toString());
                     }
@@ -461,16 +467,34 @@ public class WebSocketServer extends TextWebSocketHandler {
      * 按库里期望态补服务 + 中继链 + 限流器。任何异常都吞成日志：这是一条兜底路径，
      * 不能因为某个节点数据坏掉就影响 WS 线程或其他节点的对账。
      */
-    private void reconcileNodeState(Long nodeId) {
-        if (!reconcilingNodes.add(nodeId)) {
-            log.info("节点 {} 已有连接对账在进行，跳过本次", nodeId);
+    private static final int CONNECT_RECONCILE_RETRIES = 6;
+    private static final long CONNECT_RECONCILE_RETRY_DELAY_MS = 5_000L;
+
+    private void scheduleConnectRetry(Long nodeId, WebSocketSession expectedSession, int remaining) {
+        if (remaining <= 0) {
+            log.warn("节点 {} 连接对账仍有规则正被修改，重试次数已用完，等待下一次上报或重连", nodeId);
             return;
         }
+        CompletableFuture.delayedExecutor(CONNECT_RECONCILE_RETRY_DELAY_MS, TimeUnit.MILLISECONDS)
+                .execute(() -> reconcileNodeState(nodeId, expectedSession, remaining - 1));
+    }
+
+    private void reconcileNodeState(Long nodeId, WebSocketSession expectedSession, int remaining) {
+        // 延迟任务只属于创建它的连接；重连后绝不对新的 session 使用旧任务。
+        if (expectedSession == null || nodeSessions.get(nodeId) != expectedSession || !expectedSession.isOpen()) return;
+        if (!reconcilingNodes.add(nodeId)) {
+            log.info("节点 {} 已有连接对账在进行，稍后重试", nodeId);
+            scheduleConnectRetry(nodeId, expectedSession, remaining);
+            return;
+        }
+        boolean retry = false;
         try {
             log.warn("节点 {} 连接后未上报资源清单，按库对账补一遍", nodeId);
             List<String> repaired = forwardService.resyncNodeServices(nodeId, RECONCILE_UNKNOWN, RECONCILE_UNKNOWN);
             if (!repaired.isEmpty()) {
                 log.warn("节点 {} 连接对账补齐：{}", nodeId, String.join("；", repaired));
+                // 规则锁只保护一条转发；不同入口同时对账时失败方必须再试一次。
+                retry = repaired.stream().anyMatch(note -> note != null && note.contains("正在被编辑或对账"));
             }
             List<String> limiterNotes = speedLimitService.resyncNodeLimiters(nodeId);
             if (!limiterNotes.isEmpty()) {
@@ -481,12 +505,14 @@ public class WebSocketServer extends TextWebSocketHandler {
         } finally {
             reconcilingNodes.remove(nodeId);
         }
+        if (retry) scheduleConnectRetry(nodeId, expectedSession, remaining);
     }
 
     /**
      * 对"以该节点为入口、库里 status=0"的转发逐个补发 PauseService。
      * 只负责把期望态发出去：失败只记日志，不改库、不影响连接建立（节点侧重复 pause 是空操作）。
-     * 服务名与 ForwardServiceImpl#buildServiceName 保持一致：forwardId_userId_userTunnelId。
+     * 服务名口径见 {@link #serviceNameCandidates}：普通用户是 forwardId_userId_userTunnelId，
+     * 管理员创建时 userTunnel 恒为 null，尾缀固定 0。
      */
     private void pauseForwardsExpectingPaused(Long nodeId) {
         List<ChainTunnel> ingress = chainTunnelService.list(new QueryWrapper<ChainTunnel>()
@@ -504,21 +530,86 @@ public class WebSocketServer extends TextWebSocketHandler {
                 .in("tunnel_id", tunnelIds)
                 .eq("status", 0));
         for (Forward forward : paused) {
-            UserTunnel userTunnel = userTunnelService.getOne(new QueryWrapper<UserTunnel>()
-                    .eq("user_id", forward.getUserId())
-                    .eq("tunnel_id", forward.getTunnelId()));
-            String serviceName = forward.getId() + "_" + forward.getUserId() + "_"
-                    + (userTunnel != null ? userTunnel.getId() : 0);
+            pauseForwardOnNode(nodeId, forward);
+        }
+    }
+
+    /**
+     * 给单条暂停转发补发 PauseService：按候选名依次尝试，命中就收手。
+     *
+     * <p>not found 说明这个名字在节点上根本不存在（多半是尾缀口径不同），换下一个候选；
+     * 其它结果（OK / 超时 / 失败）都代表名字命中，不再拿另一套名字重复下发。
+     */
+    private void pauseForwardOnNode(Long nodeId, Forward forward) {
+        List<String> serviceNames = serviceNameCandidates(nodeId, forward);
+        for (int i = 0; i < serviceNames.size(); i++) {
+            String serviceName = serviceNames.get(i);
             GostDto gostDto = GostUtil.PauseAndResumeService(nodeId, serviceName, "PauseService");
             String pauseMsg = gostDto == null || gostDto.getMsg() == null ? "节点无响应" : gostDto.getMsg();
             if (GostUtil.notFound(pauseMsg)) {
                 // 服务本就不在节点上（配置被清空或已被改名），没有需要暂停的东西，
                 // 恢复时由重建路径按库补建，这里不该刷失败日志。
-                log.debug("节点 {} 重连对账：暂停服务 {} 在节点上不存在，跳过补发", nodeId, serviceName);
-            } else if (!Objects.equals("OK", pauseMsg)) {
+                log.debug("节点 {} 重连对账：暂停服务 {} 在节点上不存在{}", nodeId, serviceName,
+                        i + 1 < serviceNames.size() ? "，按另一套服务名再试" : "，跳过补发");
+                continue;
+            }
+            if (!Objects.equals("OK", pauseMsg)) {
                 log.info("节点 {} 重连对账：补发暂停 {} 失败: {}", nodeId, serviceName, pauseMsg);
             }
+            return;
         }
+    }
+
+    /**
+     * 该转发在节点上的服务名候选，按"最可能命中"排序。
+     *
+     * <p>创建口径是 forwardId_userId_userTunnelId，其中 userTunnel 只在普通用户路径上取
+     * （ForwardServiceImpl#checkUserPermissions 对管理员直接返回 userTunnel=null），
+     * 所以管理员创建的转发尾缀固定是 0。管理员在同一隧道下通常也有一行 user_tunnel，
+     * 若按那行 id 拼名字，节点上根本没有这个服务，重连补暂停就永远打空。
+     *
+     * <p>角色按库内当下值判定；角色在建转发之后可能变过（升/降权），主口径 not found 时
+     * 用另一套尾缀再试一次。用户行查不到（删库竞态 / DB 抖动）时不猜，两套都列出来：
+     * PauseService 对不存在的名字是空操作，宁可多一条消息也不能漏补。
+     */
+    private List<String> serviceNameCandidates(Long nodeId, Forward forward) {
+        Integer userId = forward.getUserId();
+        // 角色与 user_tunnel 分开查：一次查询失败不能把另一条线索也扔了，
+        // 否则「用户表读不到但权限行读得到」时只剩一个候选名，正好可能漏补。
+        Boolean ownerIsAdmin = null;
+        try {
+            User owner = userId == null ? null : userService.getById(userId);
+            if (owner == null) {
+                log.info("节点 {} 重连对账：转发 {} 的属主 {} 查不到，暂停服务名按两套口径兜底",
+                        nodeId, forward.getId(), userId);
+            } else {
+                ownerIsAdmin = Integer.valueOf(0).equals(owner.getRoleId());
+            }
+        } catch (Exception e) {
+            log.info("节点 {} 重连对账：查询转发 {} 的属主角色失败，暂停服务名按两套口径兜底: {}",
+                    nodeId, forward.getId(), e.getMessage());
+        }
+        Integer userTunnelId = null;
+        try {
+            UserTunnel userTunnel = userId == null ? null : userTunnelService.getOne(new QueryWrapper<UserTunnel>()
+                    .eq("user_id", userId)
+                    .eq("tunnel_id", forward.getTunnelId()));
+            userTunnelId = userTunnel == null ? null : userTunnel.getId();
+        } catch (Exception e) {
+            log.info("节点 {} 重连对账：查询转发 {} 的隧道权限失败，暂停服务名按两套口径兜底: {}",
+                    nodeId, forward.getId(), e.getMessage());
+        }
+        String byUserTunnel = forward.getId() + "_" + userId + "_" + (userTunnelId == null ? 0 : userTunnelId);
+        String byAdmin = forward.getId() + "_" + userId + "_0";
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        if (Boolean.TRUE.equals(ownerIsAdmin)) {
+            names.add(byAdmin);
+            names.add(byUserTunnel);
+        } else {
+            names.add(byUserTunnel);
+            names.add(byAdmin);
+        }
+        return new ArrayList<>(names);
     }
 
     /** 报表侧调度：send_msg 最长等节点 10 秒，不能占着 WS 线程。 */
@@ -879,6 +970,60 @@ public class WebSocketServer extends TextWebSocketHandler {
     }
 
     /**
+     * 摘要可信度闸门：只有 DDNS 域名映射确实可信时，节点上报的摘要才能用来判「漂移」。
+     *
+     * <p>为什么必须在够到 {@code resyncNodeServices} 之前拦：期望摘要由注册表渲染后算出，
+     * 映射没装载（启动窗口、读库失败）或某个域名还没解析出主地址时，期望值会退化成域名本身，
+     * 与节点上真实的 IP 目标必然不等，于是整对服务被删了重建 —— 这正是启动瞬间断流的来源。
+     * 判成不可信时返回 {@code null}，下游按「这台节点没报摘要」处理：只补缺失、绝不删建。
+     *
+     * <p>判定分两层：整体未降级直接放行（绝大多数情况，不查库）；降级时再按该节点实际承载的
+     * 转发目标逐个问，只有真踩到未就绪域名的节点才被拦，健康节点照常对账。
+     * 公开可见是为了让单测直接验证这道闸门本身（清扫线程里就是这一行）。
+     *
+     * @return 原样返回可信的摘要；不可信返回 null
+     */
+    public Map<String, String> trustedReportedDigests(Long nodeId, Map<String, String> digests) {
+        if (digests == null || digests.isEmpty()) {
+            return digests;
+        }
+        if (!DdnsTargetRenderer.digestTrustDegraded()) {
+            return digests;
+        }
+        if (!DdnsTargetRenderer.digestTrustReady()) {
+            log.warn("DDNS 域名映射尚未就绪，节点 {} 本轮不按摘要做删建（只补缺失服务）", nodeId);
+            return null;
+        }
+        try {
+            List<ForwardPort> ports = forwardPortService.list(
+                    new QueryWrapper<ForwardPort>().eq("node_id", nodeId));
+            if (ports != null) {
+                for (ForwardPort port : ports) {
+                    if (port == null || port.getForwardId() == null) {
+                        continue;
+                    }
+                    Forward forward = forwardService.getById(port.getForwardId());
+                    if (forward == null) {
+                        continue;
+                    }
+                    String issue = DdnsTargetRenderer.anyDigestTrustIssue(forward.getRemoteAddr());
+                    if (issue != null) {
+                        log.warn("节点 {} 的转发 {} 摘要暂不可信（{}），本轮不按摘要做删建（只补缺失服务）",
+                                nodeId, forward.getId(), issue);
+                        return null;
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
+            // 判不出来就当不可信：宁可少对账一轮（下一次上报还会再来），也不能拿错的期望值删服务
+            log.warn("节点 {} 摘要可信度判定失败（{}），本轮按不可信处理、不按摘要做删建",
+                    nodeId, e.toString());
+            return null;
+        }
+        return digests;
+    }
+
+    /**
      * 孤儿清扫是库查询 + 逐条下发（每次等节点 10s），不能占用 WS 消息线程。
      * 同一节点同一时刻只跑一轮，重复上报直接丢弃（下一次上报还会重新扫）。
      */
@@ -908,8 +1053,10 @@ public class WebSocketServer extends TextWebSocketHandler {
                 // 否则节点丢了 gost.json 后活跃转发静默失效，面板还显示正常。
                 // chains 必须一起传：中继链缺失时入口/链/出口三段的监听都指向不存在的链。
                 try {
+                    // 映射未就绪的域名不许参与漂移判定：宁可不补，也不能按错的期望值删建
+                    Map<String, String> trustedDigests = trustedReportedDigests(nodeId, reportedDigests);
                     List<String> repaired = forwardService.resyncNodeServices(
-                            nodeId, services, chains, reportedDigests, reportedChainDigests);
+                            nodeId, services, chains, trustedDigests, reportedChainDigests);
                     if (!repaired.isEmpty()) {
                         log.warn("节点 {} 服务补齐：{}", nodeId, String.join("；", repaired));
                     }
@@ -1298,6 +1445,17 @@ public class WebSocketServer extends TextWebSocketHandler {
             log.info("成功发送消息到节点 {} 并收到响应: {}", node_id, result.getMsg());
             return result;
             
+        } catch (InterruptedException e) {
+            // 清掉等待表，并把中断标记恢复：调用方（例如 shutdownNow 打断的探测工作线程）必须看到中断信号，
+            // 吞成「发送失败」会让它把一次被中断的等待当成节点没回包，继续往后探测。
+            pendingRequests.remove(requestId);
+            Thread.currentThread().interrupt();
+
+            GostDto result = new GostDto();
+            result.setMsg("发送消息失败: 等待响应被中断");
+            log.info("发送消息到节点 {} 被中断，已恢复中断标记", node_id);
+            return result;
+
         } catch (Exception e) {
             // 清理请求和映射关系
             pendingRequests.remove(requestId);

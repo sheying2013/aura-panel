@@ -65,6 +65,17 @@ export default function AdminLayout({
       )
     },
     {
+      path: '/ddns',
+      label: '动态解析',
+      icon: (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" strokeWidth="1.5" />
+          <path strokeLinecap="round" strokeWidth="1.5" d="M3 12h18M12 3c-3 3-3 15 0 18M12 3c3 3 3 15 0 18" />
+        </svg>
+      ),
+      adminOnly: true
+    },
+    {
       path: '/tunnel',
       label: '隧道管理',
       icon: (

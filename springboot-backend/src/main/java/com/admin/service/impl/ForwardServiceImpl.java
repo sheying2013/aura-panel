@@ -8,7 +8,11 @@ import com.admin.common.utils.JwtUtil;
 import com.admin.common.utils.MapParamUtils;
 import com.admin.common.utils.PauseReason;
 import com.admin.common.utils.QuotaResume;
+import com.admin.common.utils.ResourceLifecycleLocks;
+import com.admin.common.utils.ForwardWriteLocks;
 import com.admin.common.utils.WebSocketServer;
+import com.admin.ddns.DdnsDomainGate;
+import com.admin.ddns.DdnsTargetRenderer;
 import com.admin.entity.*;
 import com.admin.mapper.ForwardMapper;
 import com.admin.service.*;
@@ -115,6 +119,7 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
      * 进程内锁，多实例部署时仍可能重复，属已知残留（与 TunnelServiceImpl 的 TOPOLOGY_LOCKS 同口径）。
      */
     private static final ConcurrentHashMap<String, ReentrantLock> FORWARD_NAME_LOCKS = new ConcurrentHashMap<>();
+
 
     /**
      * 入口节点端口分配的串行化锁：getNodePort 只读库（"这段端口没人用"），到 forward_port 落库之间没有互斥时，
@@ -250,10 +255,48 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
         return R.ok(forwardList);
     }
 
+    /**
+     * 取不到下发窗口时给前端的说法：区分「正在切换」和「正有别的下发占用」。
+     *
+     * <p>真正挡住并发的是 {@link DdnsTargetRenderer#beginDispatch} 拿到的共享凭证，这里只是文案。
+     * 只查 {@link DdnsTargetRenderer#anyTransitioning} 挡不住「查完到下发之间」被切换插进来：
+     * 那段时间注册表仍是旧值，按旧值渲染会把节点刚接受的新地址改回去，对账也会继续按旧值修。
+     */
+    private static String ddnsBlockedReason(String... remoteAddrs) {
+        for (String remoteAddr : remoteAddrs) {
+            if (DdnsTargetRenderer.anyTransitioning(remoteAddr)) {
+                return "目标域名正在 DDNS 切换（节点尚未确认新地址），本次未改动任何节点；请等该域名切换确认后再操作";
+            }
+        }
+        return "目标域名正有其它下发（编辑/删除/对账）在写节点，未能取得下发窗口，本次未改动任何节点；请稍后重试";
+    }
+
     @Override
     public R createForward(ForwardDto forwardDto) {
         UserInfo currentUser = getCurrentUserInfo();
 
+        // 生命周期锁（单 JVM）：deleteTunnel / deleteUser 会按 tunnel_id / user_id 把转发直接 purge 掉，
+        // 而这里从校验、落库到逐入口节点下发之间原本没有任何互斥 —— 删除侧读完最后一次漂移快照之后，
+        // 新请求照样能把行写进去、把服务建到节点上，随后 purge 删行，节点上留下一条库里再也查不到的服务。
+        // 键与删除侧完全相同（隧道键 + 属主用户键），一次性交给 ResourceLifecycleLocks 排序后获取；
+        // 它位于 DDNS 下发闸门之外，三个入口的顺序都是「生命周期 → DDNS → 节点端口」，不会成环。
+        ResourceLifecycleLocks.Lease lifecycleLease = ResourceLifecycleLocks.acquire(
+                ResourceLifecycleLocks.CREATE_WAIT_MILLIS,
+                ResourceLifecycleLocks.userKey(currentUser.getUserId()),
+                ResourceLifecycleLocks.tunnelKey(forwardDto.getTunnelId()));
+        if (lifecycleLease == null) {
+            return R.err("该用户或隧道正在被创建/删除，本次未改动任何节点，请稍后重试");
+        }
+        try {
+            return createForwardLocked(forwardDto, currentUser);
+        } finally {
+            lifecycleLease.close();
+        }
+    }
+
+    /** 生命周期锁内的创建流程：键已取齐并持有到最后一个节点下发完成。 */
+    private R createForwardLocked(ForwardDto forwardDto, UserInfo currentUser) {
+        // 持锁后重读隧道：等锁期间它可能已经被 deleteTunnel 删掉，按旧结论继续就只会在节点上留下孤儿
         Tunnel tunnel = validateTunnel(forwardDto.getTunnelId());
         if (tunnel == null) {
             return R.err("隧道不存在");
@@ -289,6 +332,12 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
         // 再查端口、再落库，中间任何一步都不放开，避免两个并发创建分到同一个 (node_id, port)。
         // 锁要一直持有到最后一个 forward_port 写入完成——循环里每写一行就马上下发节点服务，
         // 撤回与端口回写都依赖这行已经在库里，因此节点下发也在同一段临界区内（单次创建、多入口节点的量级）。
+        // 与 DDNS 切换窗口互斥：凭证必须覆盖「查端口 → 落库 → 逐节点下发 → 失败补偿」整个过程，
+        // 否则切换可能插在中间，让节点上出现新旧两套目标地址。只检查标志挡不住这个窗口。
+        DdnsDomainGate.Lease ddnsLease = DdnsTargetRenderer.beginDispatch(forward.getRemoteAddr());
+        if (ddnsLease == null) {
+            return R.err(ddnsBlockedReason(forward.getRemoteAddr()));
+        }
         List<ReentrantLock> portLocks = lockNodePorts(chainTunnels.stream().map(ChainTunnel::getNodeId).toList());
         try {
             chainTunnels = get_port(chainTunnels, forwardDto.getInPort(), 0L);
@@ -369,6 +418,7 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
             return R.ok();
         } finally {
             unlockNodePorts(portLocks);
+            ddnsLease.close();
         }
     }
 
@@ -818,10 +868,16 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                                        String serviceName, Integer limiter, Tunnel tunnel) {
         List<String> failures = new ArrayList<>();
         for (NodeServiceUpdate update : applied) {
-            GostDto gostDto = GostUtil.AddAndUpdateService(serviceName, limiter, update.node, originalForward,
-                    update.storedPort, tunnel, "UpdateService");
-            if (!Objects.equals(gostDto.getMsg(), "OK")) {
-                failures.add("node" + update.node.getId() + "(" + gostDto.getMsg() + ")");
+            try {
+                GostDto gostDto = GostUtil.AddAndUpdateService(serviceName, limiter, update.node, originalForward,
+                        update.storedPort, tunnel, "UpdateService");
+                if (!Objects.equals(gostDto.getMsg(), "OK")) {
+                    failures.add("node" + update.node.getId() + "(" + gostDto.getMsg() + ")");
+                }
+            } catch (RuntimeException e) {
+                // 补偿路径自己不能再抛：抛出会中断后面节点的补偿，还会把调用方正在上报的原始错误吞成
+                // 一个新的异常。这里降级成一条失败明细，让剩下的节点继续改回原配置。
+                failures.add("node" + update.node.getId() + "(补偿异常：" + e.getMessage() + ")");
             }
         }
         return failures.isEmpty() ? null
@@ -888,6 +944,22 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
     private String migrateForwardEntries(Tunnel tunnel, Tunnel rollbackTunnel, Forward forward, List<ChainTunnel> oldEntries,
                                          List<ChainTunnel> newEntries, Map<Long, Node> nodes,
                                          List<EntryMigration> migrated) {
+        // 整段迁移（新入口下发 → 旧入口清理 → 失败时按 rollbackTunnel 回退）必须同一个窗口：
+        // 中途放开，回退里的 CreateForwardService 会按注册表渲染，切换边界上抛错就把旧入口留在「已删」状态。
+        DdnsDomainGate.Lease ddnsLease = DdnsTargetRenderer.beginDispatch(forward.getRemoteAddr());
+        if (ddnsLease == null) {
+            return "转发" + forward.getId() + " 目标域名正在 DDNS 切换（或有其它下发占用），本次未迁移入口";
+        }
+        try {
+            return migrateForwardEntriesInWindow(tunnel, rollbackTunnel, forward, oldEntries, newEntries, nodes, migrated);
+        } finally {
+            ddnsLease.close();
+        }
+    }
+
+    private String migrateForwardEntriesInWindow(Tunnel tunnel, Tunnel rollbackTunnel, Forward forward,
+                                                 List<ChainTunnel> oldEntries, List<ChainTunnel> newEntries,
+                                                 Map<Long, Node> nodes, List<EntryMigration> migrated) {
         List<ForwardPort> rows;
         try {
             rows = forwardPortService.list(new QueryWrapper<ForwardPort>().eq("forward_id", forward.getId()));
@@ -954,8 +1026,15 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                 if (writeError != null) {
                     deleteForwardServices(newNodeId, serviceName);
                     Node oldNode = nodeService.getById(oldNodeId);
-                    GostDto restored = oldNode == null ? null
-                            : GostUtil.CreateForwardService(serviceName, limiter, oldNode, forward, row, rollbackTunnel);
+                    GostDto restored = null;
+                    if (oldNode != null) {
+                        try {
+                            restored = GostUtil.CreateForwardService(serviceName, limiter, oldNode, forward, row, rollbackTunnel);
+                        } catch (RuntimeException e) {
+                            // 回退是补救动作：它自己抛错会把「库写入失败」这条真正原因盖掉
+                            return writeError + "，新入口已撤销，旧入口重建异常(" + e.getMessage() + ")，需节点上报后按库补齐";
+                        }
+                    }
                     return writeError + (restored != null && Objects.equals(restored.getMsg(), "OK")
                             ? "，已在新入口撤销并按原端口" + oldPort + "恢复旧入口服务"
                             : "，新入口已撤销，旧入口重建失败(" + (restored == null ? "旧节点不存在" : restored.getMsg())
@@ -1065,30 +1144,41 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
      */
     protected String rebuildEntryService(Tunnel tunnel, Node node, Forward forward, ForwardPort stored,
                                        String serviceName, Integer limiter) {
-        GostDto cleanup = deleteForwardServices(node.getId(), serviceName);
-        if (!Objects.equals(cleanup.getMsg(), "OK")) {
-            return "转发" + forward.getId() + "节点" + node.getId() + "清理旧服务未确认(" + cleanup.getMsg() + ")";
+        // 删除与重建之间必须一直持有凭证：否则「旧服务已删 → 切换开始 → 重建按注册表渲染抛错」
+        // 会让节点上什么都不剩（业务中断），而库里仍以为服务存在。
+        DdnsDomainGate.Lease ddnsLease = DdnsTargetRenderer.beginDispatch(forward.getRemoteAddr());
+        if (ddnsLease == null) {
+            return "转发" + forward.getId() + "节点" + node.getId()
+                    + "目标域名正在 DDNS 切换（或有其它下发占用），本次未清理旧服务、也未重建";
         }
-        ForwardPort target = new ForwardPort();
-        target.setId(stored.getId());
-        target.setForwardId(stored.getForwardId());
-        target.setNodeId(stored.getNodeId());
-        target.setPort(stored.getPort());
-        GostDto created = createEntryServiceWithPortRetry(node, forward, tunnel, serviceName, limiter, target);
-        if (!isOkMsg(created.getMsg())) {
-            return "转发" + forward.getId() + "节点" + node.getId() + "按新类型下发失败：" + created.getMsg();
-        }
-        if (!Objects.equals(target.getPort(), stored.getPort())) {
-            String writeError = dbWriteError(() -> forwardPortService.updateById(target),
-                    "转发" + forward.getId() + "入口端口记录更新");
-            if (writeError != null) {
-                deleteForwardServices(node.getId(), serviceName);
-                return writeError;
+        try {
+            GostDto cleanup = deleteForwardServices(node.getId(), serviceName);
+            if (!Objects.equals(cleanup.getMsg(), "OK")) {
+                return "转发" + forward.getId() + "节点" + node.getId() + "清理旧服务未确认(" + cleanup.getMsg() + ")";
             }
-            log.warn("类型切换重建换口：隧道{} 转发{} 节点{} 端口{} → {}", tunnel.getId(), forward.getId(),
-                    node.getId(), stored.getPort(), target.getPort());
+            ForwardPort target = new ForwardPort();
+            target.setId(stored.getId());
+            target.setForwardId(stored.getForwardId());
+            target.setNodeId(stored.getNodeId());
+            target.setPort(stored.getPort());
+            GostDto created = createEntryServiceWithPortRetry(node, forward, tunnel, serviceName, limiter, target);
+            if (!isOkMsg(created.getMsg())) {
+                return "转发" + forward.getId() + "节点" + node.getId() + "按新类型下发失败：" + created.getMsg();
+            }
+            if (!Objects.equals(target.getPort(), stored.getPort())) {
+                String writeError = dbWriteError(() -> forwardPortService.updateById(target),
+                        "转发" + forward.getId() + "入口端口记录更新");
+                if (writeError != null) {
+                    deleteForwardServices(node.getId(), serviceName);
+                    return writeError;
+                }
+                log.warn("类型切换重建换口：隧道{} 转发{} 节点{} 端口{} → {}", tunnel.getId(), forward.getId(),
+                        node.getId(), stored.getPort(), target.getPort());
+            }
+            return null;
+        } finally {
+            ddnsLease.close();
         }
-        return null;
     }
 
     /**
@@ -1154,9 +1244,16 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                 if (oldNode == null) {
                     problems.add("旧入口节点" + migration.oldNodeId + "不存在，无法恢复服务");
                 } else {
-                    GostDto restored = GostUtil.CreateForwardService(migration.serviceName, migration.limiter,
-                            oldNode, migration.forward, migration.row, migration.tunnel);
-                    if (!Objects.equals(restored.getMsg(), "OK")) {
+                    // 回滚是补救动作：单个节点抛错不能中断其余迁移的回滚
+                    GostDto restored;
+                    try {
+                        restored = GostUtil.CreateForwardService(migration.serviceName, migration.limiter,
+                                oldNode, migration.forward, migration.row, migration.tunnel);
+                    } catch (RuntimeException e) {
+                        problems.add("旧入口节点" + migration.oldNodeId + "恢复服务异常(" + e.getMessage() + ")");
+                        restored = null;
+                    }
+                    if (restored != null && !Objects.equals(restored.getMsg(), "OK")) {
                         problems.add("旧入口节点" + migration.oldNodeId + "恢复服务失败(" + restored.getMsg() + ")");
                     }
                 }
@@ -1196,9 +1293,19 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
 
     @Override
     public R updateForward(ForwardUpdateDto forwardUpdateDto) {
+        if (forwardUpdateDto == null || forwardUpdateDto.getId() == null) return R.err("转发不存在");
+        ForwardWriteLocks.Lease mutationLock = ForwardWriteLocks.acquire(ForwardWriteLocks.EDIT_WAIT_MILLIS, forwardUpdateDto.getId());
+        if (mutationLock == null) return R.err("转发正在被编辑或对账，请稍后重试");
+        try {
+            return updateForwardWithMutationLock(forwardUpdateDto);
+        } finally {
+            mutationLock.close();
+        }
+    }
+
+    private R updateForwardWithMutationLock(ForwardUpdateDto forwardUpdateDto) {
         // 1. 获取当前用户信息
         UserInfo currentUser = getCurrentUserInfo();
-
 
         // 2. 检查转发是否存在
         Forward existForward = validateForwardExists(forwardUpdateDto.getId(), currentUser);
@@ -1206,7 +1313,22 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
             return R.err("转发不存在");
         }
 
+        // 新旧目标都要纳入互斥：改的若是同一条转发上的别的字段，重下发一样会把目标按注册表渲染。
+        // 只查标志挡不住「查完到下发之间」被切换插进来，所以这里真正取共享凭证并持有到整单结束。
+        DdnsDomainGate.Lease ddnsLease = DdnsTargetRenderer.beginDispatch(
+                forwardUpdateDto.getRemoteAddr(), existForward.getRemoteAddr());
+        if (ddnsLease == null) {
+            return R.err(ddnsBlockedReason(forwardUpdateDto.getRemoteAddr(), existForward.getRemoteAddr()));
+        }
+        try {
+            return updateForwardInWindow(forwardUpdateDto, currentUser, existForward);
+        } finally {
+            ddnsLease.close();
+        }
+    }
 
+    /** {@link #updateForward} 的窗口内部分：调用方已持有 DDNS 下发凭证，用户与转发也已校验。 */
+    private R updateForwardInWindow(ForwardUpdateDto forwardUpdateDto, UserInfo currentUser, Forward existForward) {
         Tunnel tunnel = validateTunnel(existForward.getTunnelId());
         if (tunnel == null) {
             return R.err("隧道不存在");
@@ -1218,6 +1340,14 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
             return R.err(permissionResult.getErrorMessage());
         }
 
+        // 角色以库内当下值为准：validateForwardExists 之后到这里的 DDNS 窗口里，账号可能已被降权。
+        // 此时若还按 JWT 的管理员身份放行，就是拿过期角色改别人的转发。管理员标志只认
+        // checkUserPermissions 刚查到的库内角色；降权后按普通用户复核属主。
+        boolean dbAdmin = permissionResult.isAdmin();
+        if (!dbAdmin && !Objects.equals(currentUser.getUserId(), existForward.getUserId())) {
+            return R.err("转发不存在");
+        }
+
         String duplicateName = duplicateForwardName(existForward.getUserId(), tunnel.getId(),
                 forwardUpdateDto.getName(), existForward.getId());
         if (duplicateName != null) {
@@ -1225,7 +1355,7 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
         }
 
         UserTunnel userTunnel;
-        if (currentUser.getRoleId() != 0) {
+        if (!dbAdmin) {
             userTunnel = getUserTunnel(currentUser.getUserId(), tunnel.getId().intValue());
             if (userTunnel == null) {
                 return R.err("你没有该隧道权限");
@@ -1361,10 +1491,18 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
 
     @Override
     public R deleteForward(Long id, boolean strict) {
+        ForwardWriteLocks.Lease mutationLock = ForwardWriteLocks.acquire(ForwardWriteLocks.EDIT_WAIT_MILLIS, id);
+        if (mutationLock == null) return R.err("该转发正在修改，本次未删除，请稍后重试");
+        try {
+            return deleteForwardWithMutationLock(id, strict);
+        } finally {
+            mutationLock.close();
+        }
+    }
 
+    private R deleteForwardWithMutationLock(Long id, boolean strict) {
         // 1. 获取当前用户信息
         UserInfo currentUser = getCurrentUserInfo();
-
 
         // 2. 检查转发是否存在
         Forward forward = validateForwardExists(id, currentUser);
@@ -1372,7 +1510,21 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
             return R.err("转发不存在");
         }
 
+        // 删除本身不渲染 remoteAddr，所以光看切换标记挡不住竞态：切换可能正好在标记检查之后开始，
+        // 于是它按旧规划往这条服务上下发，而我们正在把服务删掉。这里取共享凭证，切换窗口期间删不了。
+        DdnsDomainGate.Lease ddnsLease = DdnsTargetRenderer.beginDispatch(forward.getRemoteAddr());
+        if (ddnsLease == null) {
+            return R.err(ddnsBlockedReason(forward.getRemoteAddr()));
+        }
+        try {
+            return deleteForwardInWindow(id, strict, currentUser, forward);
+        } finally {
+            ddnsLease.close();
+        }
+    }
 
+    /** {@link #deleteForward} 的窗口内部分：调用方已持有 DDNS 下发凭证，用户与转发也已校验。 */
+    private R deleteForwardInWindow(Long id, boolean strict, UserInfo currentUser, Forward forward) {
         Tunnel tunnel = validateTunnel(forward.getTunnelId());
         if (tunnel == null) {
             return R.err("隧道不存在");
@@ -1383,8 +1535,14 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
         if (permissionResult.isHasError()) {
             return R.err(permissionResult.getErrorMessage());
         }
+        // 与更新同一口径：DDNS 窗口内可能已被降权，管理员标志只认库内当下角色，
+        // 降权后必须按普通用户复核属主，不能拿 JWT 快照继续删别人的转发。
+        boolean dbAdmin = permissionResult.isAdmin();
+        if (!dbAdmin && !Objects.equals(currentUser.getUserId(), forward.getUserId())) {
+            return R.err("转发不存在");
+        }
         UserTunnel userTunnel = null;
-        if (currentUser.getRoleId() != 0) {
+        if (!dbAdmin) {
             userTunnel = getUserTunnel(currentUser.getUserId(), tunnel.getId().intValue());
             if (userTunnel == null) {
                 return R.err("你没有该隧道权限");
@@ -1443,9 +1601,42 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
 
     @Override
     public R forceDeleteForward(Long id) {
+        ForwardWriteLocks.Lease mutationLock = ForwardWriteLocks.acquire(ForwardWriteLocks.EDIT_WAIT_MILLIS, id);
+        if (mutationLock == null) return R.err("该转发正在修改，本次未删除，请稍后重试");
+        try {
+            return forceDeleteForwardWithMutationLock(id);
+        } finally {
+            mutationLock.close();
+        }
+    }
+
+    private R forceDeleteForwardWithMutationLock(Long id) {
         UserInfo currentUser = getCurrentUserInfo();
         Forward forward = validateForwardExists(id, currentUser);
         if (forward == null) {
+            return R.err("端口转发不存在");
+        }
+        // 强制删除自己不下发节点，但删完库会立刻索取资源清单，NodeOrphanSweeper 随后按「库里没有」
+        // 把服务删掉；DDNS 切换窗口正在逐条把同一批服务改成新地址，两条路交叉就会留下
+        // 「库里没记录、节点还在监听」的孤儿（清扫跑完之后切换又建回来），或者切换把已删的服务改回旧地址。
+        // 因此与普通删除同口径：先拿共享下发凭证，窗口内不许删。
+        DdnsDomainGate.Lease ddnsLease = DdnsTargetRenderer.beginDispatch(forward.getRemoteAddr());
+        if (ddnsLease == null) {
+            return R.err(ddnsBlockedReason(forward.getRemoteAddr()));
+        }
+        try {
+            return forceDeleteForwardInWindow(id, forward, currentUser);
+        } finally {
+            ddnsLease.close();
+        }
+    }
+
+    /** {@link #forceDeleteForward} 的窗口内部分：调用方已持有 DDNS 下发凭证，用户与转发也已校验。 */
+    private R forceDeleteForwardInWindow(Long id, Forward forward, UserInfo currentUser) {
+        // 强制删除不做节点下发，但会直接删库并触发孤儿清扫。等 DDNS 窗口期间账号可能已被降权，
+        // 入参里的 currentUser 仍是 JWT 快照；删库前按库内当下角色重新校验一次属主，
+        // 否则被降权的管理员还能把别人的转发连同端口记录一起抹掉。
+        if (validateForwardExists(id, currentUser) == null) {
             return R.err("端口转发不存在");
         }
         forwardPortService.remove(new QueryWrapper<ForwardPort>().eq("forward_id", id));
@@ -1467,7 +1658,9 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
         UserInfo currentUser = getCurrentUserInfo();
 
         // 2. 检查转发是否存在且用户有权限访问
-        Forward forward = validateForwardExists(id, currentUser);
+        // 诊断是只读路径，保留原来的 JWT 视图校验；写路径（update/delete/forceDelete）一律走
+        // validateForwardExists 的库内角色复核。
+        Forward forward = validateForwardExistsForRead(id, currentUser);
         if (forward == null) {
             return R.err("转发不存在");
         }
@@ -1707,12 +1900,23 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
 
 
     private R changeForwardStatus(Long id, int targetStatus, String gostMethod) {
-        UserInfo currentUser = getCurrentUserInfo();
-        if (currentUser.getRoleId() != 0) {
-            User user = userService.getById(currentUser.getUserId());
-            if (user == null) return R.err("用户不存在");
-            if (user.getStatus() == 0) return R.err("用户已到期或被禁用");
+        ForwardWriteLocks.Lease mutationLock = ForwardWriteLocks.acquire(ForwardWriteLocks.EDIT_WAIT_MILLIS, id);
+        if (mutationLock == null) return R.err("该转发正在修改，本次未更改状态，请稍后重试");
+        try {
+            return changeForwardStatusWithMutationLock(id, targetStatus, gostMethod);
+        } finally {
+            mutationLock.close();
         }
+    }
+
+    private R changeForwardStatusWithMutationLock(Long id, int targetStatus, String gostMethod) {
+        UserInfo currentUser = getCurrentUserInfo();
+        // 暂停/恢复也是写路径：角色必须取库内当下值。原实现用 JWT 里的 role_id 选分支，
+        // 令牌仍写着管理员、库里已降权时会整段跳过流量与隧道权限校验。
+        User dbUser = currentUser.getUserId() != null ? userService.getById(currentUser.getUserId()) : null;
+        if (dbUser == null) return R.err("用户不存在");
+        boolean dbAdmin = Integer.valueOf(0).equals(dbUser.getRoleId());
+        if (!dbAdmin && dbUser.getStatus() == 0) return R.err("用户已到期或被禁用");
         Forward forward = validateForwardExists(id, currentUser);
         if (forward == null) {
             return R.err("转发不存在");
@@ -1723,12 +1927,15 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
             return R.err("隧道不存在");
         }
 
+        // 这里不再整单拒绝：PauseAndResumeService 只用服务名、不渲染 remoteAddr，暂停/恢复本身
+        // 与 DDNS 切换不冲突（到期/停用用户必须还能被暂停）。真正会按注册表渲染的是
+        // applyStatusChange 里「服务已丢失要重建」那条分支，它自己取凭证。
         UserTunnel userTunnel = null;
         if (targetStatus == 1) {
             if (tunnel.getStatus() != 1) {
                 return R.err("隧道已禁用，无法恢复服务");
             }
-            if (currentUser.getRoleId() != 0) {
+            if (!dbAdmin) {
                 R flowCheckResult = checkUserFlowLimits(currentUser.getUserId(), tunnel);
                 if (flowCheckResult.getCode() != 0) {
                     return flowCheckResult;
@@ -1742,7 +1949,7 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                 }
             }
         }
-        if (currentUser.getRoleId() != 0 && userTunnel == null) {
+        if (!dbAdmin && userTunnel == null) {
             userTunnel = getUserTunnel(currentUser.getUserId(), tunnel.getId().intValue());
             if (userTunnel == null) {
                 return R.err("你没有该隧道权限");
@@ -1799,7 +2006,24 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                     // round27：节点上这条服务已经不在了（节点重装/配置被清空，而暂停态的转发不在补齐范围），
                     // 只发 ResumeService 只会一直回 not found，库里却已经恢复成活跃——流量永远起不来。
                     // 这里按库里的端口把服务重建出来，重建失败再把原因带回前端。
-                    GostDto rebuilt = rebuildMissingForwardService(forward, userTunnel, node, serviceName);
+                    // 重建会按注册表渲染 remoteAddr：切换窗口内不能建（建出来的是旧地址），
+                    // 也不能不拿凭证就建（建到一半切换开始）。拿不到就留给切换结束后的对账补齐。
+                    GostDto rebuilt;
+                    DdnsDomainGate.Lease rebuildLease = DdnsTargetRenderer.beginDispatch(forward.getRemoteAddr());
+                    if (rebuildLease == null) {
+                        unfinished.add("节点" + node.getId()
+                                + "：目标域名正在 DDNS 切换（或有其它下发占用），本次未重建，切换结束后由对账补齐");
+                        continue;
+                    }
+                    try {
+                        rebuilt = rebuildMissingForwardService(forward, userTunnel, node, serviceName);
+                    } catch (RuntimeException e) {
+                        unfinished.add("节点" + node.getId() + "：重建失败（"
+                                + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()) + "）");
+                        continue;
+                    } finally {
+                        rebuildLease.close();
+                    }
                     if (Objects.equals("OK", rebuilt.getMsg())) {
                         log.warn("恢复转发 {}：节点{} 上服务 {} 已丢失，已按库重建", forward.getId(), node.getId(), serviceName);
                         continue;
@@ -2022,7 +2246,25 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
      */
     private List<String> resumeForwards(List<Forward> forwards) {
         List<String> notes = new ArrayList<>();
-        for (Forward forward : forwards) {
+        for (Forward snapshot : forwards) {
+            ForwardWriteLocks.Lease mutationLock = ForwardWriteLocks.tryAcquire(snapshot.getId());
+            if (mutationLock == null) {
+                notes.add("转发" + snapshot.getId() + "：正在修改，未自动恢复");
+                continue;
+            }
+            try {
+            Forward forward = this.getById(snapshot.getId());
+            if (forward == null || !Objects.equals(forward.getStatus(), 0)
+                    || !Objects.equals(forward.getPauseReason(), snapshot.getPauseReason())
+                    || !Objects.equals(forward.getUserId(), snapshot.getUserId())
+                    || !Objects.equals(forward.getTunnelId(), snapshot.getTunnelId())) {
+                continue;
+            }
+            User currentOwner = userService.getById(forward.getUserId());
+            if (currentOwner == null || !QuotaResume.usable(currentOwner.getStatus(), currentOwner.getExpTime(), System.currentTimeMillis())) {
+                notes.add("转发" + forward.getId() + "：账号当前不可用，未恢复");
+                continue;
+            }
             Tunnel tunnel = tunnelService.getById(forward.getTunnelId());
             if (tunnel == null) {
                 notes.add("转发" + forward.getId() + "：隧道不存在，未恢复");
@@ -2033,6 +2275,13 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                 continue;
             }
             UserTunnel userTunnel = getUserTunnel(forward.getUserId(), forward.getTunnelId());
+            long now = System.currentTimeMillis();
+            if (QuotaResume.userOverQuota(currentOwner.getFlow(), currentOwner.getInFlow(), currentOwner.getOutFlow())
+                    || (userTunnel != null && (!QuotaResume.usable(userTunnel.getStatus(), userTunnel.getExpTime(), now)
+                    || QuotaResume.userTunnelOverQuota(userTunnel.getFlow(), userTunnel.getInFlow(), userTunnel.getOutFlow())))) {
+                notes.add("转发" + forward.getId() + "：当前配额或用户隧道状态不允许恢复");
+                continue;
+            }
             List<ChainTunnel> chainTunnels = chainTunnelService.list(new QueryWrapper<ChainTunnel>()
                     .eq("tunnel_id", forward.getTunnelId()).eq("chain_type", 1));
             if (chainTunnels.isEmpty()) {
@@ -2044,6 +2293,9 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                 for (Object item : (List<?>) r.getData()) {
                     notes.add(String.valueOf(item));
                 }
+            }
+            } finally {
+                mutationLock.close();
             }
         }
         return notes;
@@ -2237,18 +2489,47 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
         return tunnelService.getById(tunnelId);
     }
 
+    /**
+     * 写路径（update/delete/forceDelete）的存在性 + 属主校验。
+     * 角色必须取库内当下值：JWT 里的 role_id 是签发时的快照，等 DDNS 窗口期间账号可能已被降权。
+     * 库查询异常不兜底、不吞掉，直接向上抛，避免把"查不到角色"当成管理员放行。
+     */
     private Forward validateForwardExists(Long forwardId, UserInfo currentUser) {
         Forward forward = this.getById(forwardId);
         if (forward == null) {
             return null;
         }
 
-        // 普通用户只能操作自己的转发
+        Integer userId = currentUser.getUserId();
+        // 账号缺失（已删除/查不到）一律 fail-closed：原实现把 dbUser == null 只当成"非管理员"，
+        // 随后仅凭 userId 与 forward.userId 相等就放行（双方同为 null 时 Objects.equals 也成立），
+        // 等于让已删除账号继续 update/delete/forceDelete/pause 自己的转发，双 null 更是任意放行。
+        if (userId == null) {
+            return null;
+        }
+        User dbUser = userService.getById(userId);
+        if (dbUser == null) {
+            return null;
+        }
+        boolean dbAdmin = Integer.valueOf(0).equals(dbUser.getRoleId());
+        if (!dbAdmin &&
+                !Objects.equals(userId, forward.getUserId())) {
+            return null;
+        }
+
+        return forward;
+    }
+
+    /** 只读诊断路径：沿用 JWT 视图做属主过滤，不产生任何写操作。 */
+    private Forward validateForwardExistsForRead(Long forwardId, UserInfo currentUser) {
+        Forward forward = this.getById(forwardId);
+        if (forward == null) {
+            return null;
+        }
         if (!currentUser.isAdmin() &&
                 !Objects.equals(currentUser.getUserId(), forward.getUserId())) {
             return null;
         }
-
         return forward;
     }
 
@@ -2260,12 +2541,22 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
      * @param skipQuota 删除已有转发时不检查数量配额：满配额的用户必须还能删自己的转发
      */
     private UserPermissionResult checkUserPermissions(UserInfo currentUser, Tunnel tunnel, Long excludeForwardId, boolean skipQuota) {
-        if (currentUser.isAdmin()) {
-            return UserPermissionResult.success(null, null);
-        }
-
-        // 获取用户信息
+        // 账号身份以库为准，不信 JWT 快照：getCurrentUserInfo() 读的是签发时的 role_id。
+        // 等生命周期锁期间账号可能已被 deleteUser 删掉、或被 updateUser 降权，此时再建转发
+        // 就等于给一个不存在的属主下发一条永远没人认领的节点服务。
+        // 原实现先用 isAdmin() 提前 return，已删除/已降权的管理员因此绕过后面全部复查
+        // （锁内只复查了 tunnel），这里把重读提到角色判定之前。
         User userInfo = userService.getById(currentUser.getUserId());
+        if (userInfo == null) {
+            return UserPermissionResult.error("用户不存在");
+        }
+        // 角色同样按库内值判定：令牌写着管理员、库里已降为普通用户时，必须走完整校验（隧道权限/配额）
+        if (Integer.valueOf(0).equals(userInfo.getRoleId())) {
+            return UserPermissionResult.success(null, null, true);
+        }
+        if (currentUser.isAdmin()) {
+            log.warn("用户 {} 的令牌角色为管理员，但库中角色为 {}，按库内角色校验权限", currentUser.getUserId(), userInfo.getRoleId());
+        }
         if (userInfo.getExpTime() != null && userInfo.getExpTime() <= System.currentTimeMillis()) {
             return UserPermissionResult.error("当前账号已到期");
         }
@@ -2301,7 +2592,7 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
             }
         }
 
-        return UserPermissionResult.success(userTunnel.getSpeedId(), userTunnel);
+        return UserPermissionResult.success(userTunnel.getSpeedId(), userTunnel, false);
     }
 
     private R checkForwardQuota(Integer userId, Integer tunnelId, UserTunnel userTunnel, User userInfo, Long excludeForwardId) {
@@ -2375,13 +2666,37 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
      */
     @Override
     public List<String> pauseForDisabledUser(Long userId) {
-        List<String> notes = new ArrayList<>();
-        if (userId == null) {
-            return notes;
+        if (userId == null) return new ArrayList<>();
+        // 与账号启停共用用户生命周期锁，先用户再规则，避免补偿用旧禁用状态覆盖重新启用。
+        ResourceLifecycleLocks.Lease userLease = ResourceLifecycleLocks.acquire(
+                0L, ResourceLifecycleLocks.userKey(userId));
+        if (userLease == null) return new ArrayList<>(List.of("用户" + userId + "正在更新，稍后重试暂停"));
+        try {
+            return pauseForDisabledUserLocked(userId);
+        } finally {
+            userLease.close();
         }
+    }
+
+    private List<String> pauseForDisabledUserLocked(Long userId) {
+        List<String> notes = new ArrayList<>();
         List<Forward> active = this.list(new QueryWrapper<Forward>().eq("user_id", userId).eq("status", 1));
-        for (Forward forward : active) {
+        for (Forward snapshot : active) {
+            ForwardWriteLocks.Lease mutationLock = ForwardWriteLocks.tryAcquire(snapshot.getId());
+            if (mutationLock == null) {
+                notes.add("转发" + snapshot.getId() + "：正在修改，未自动暂停");
+                continue;
+            }
             try {
+                Forward forward = this.getById(snapshot.getId());
+                if (forward == null || !Objects.equals(forward.getStatus(), 1)
+                        || !Objects.equals(userId.longValue(), forward.getUserId() == null ? null : forward.getUserId().longValue())) {
+                    continue;
+                }
+                User owner = userService.getById(userId);
+                if (owner == null || !Objects.equals(owner.getStatus(), 0)) {
+                    continue; // 账号已重新启用或被删除，不得执行旧的停用指令
+                }
                 UserTunnel userTunnel = getUserTunnel(forward.getUserId(), forward.getTunnelId());
                 List<ChainTunnel> chainTunnels = chainTunnelService.list(
                         new QueryWrapper<ChainTunnel>().eq("tunnel_id", forward.getTunnelId()).eq("chain_type", 1));
@@ -2392,8 +2707,10 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                     }
                 }
             } catch (Exception e) {
-                log.warn("停用用户 {} 时暂停转发 {} 失败", userId, forward.getId(), e);
-                notes.add("转发" + forward.getId() + "：" + e.getMessage());
+                log.warn("停用用户 {} 时暂停转发 {} 失败", userId, snapshot.getId(), e);
+                notes.add("转发" + snapshot.getId() + "：" + e.getMessage());
+            } finally {
+                mutationLock.close();
             }
         }
         return notes;
@@ -2588,20 +2905,24 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
         private final String errorMessage;
         private final Integer limiter;
         private final UserTunnel userTunnel;
+        /** 管理员标志取自库内角色，不取 JWT 快照；窗口内复核与命名都只认这个值。 */
+        private final boolean admin;
 
-        private UserPermissionResult(boolean hasError, String errorMessage, Integer limiter, UserTunnel userTunnel) {
+        private UserPermissionResult(boolean hasError, String errorMessage, Integer limiter, UserTunnel userTunnel,
+                                     boolean admin) {
             this.hasError = hasError;
             this.errorMessage = errorMessage;
             this.limiter = limiter;
             this.userTunnel = userTunnel;
+            this.admin = admin;
         }
 
-        public static UserPermissionResult success(Integer limiter, UserTunnel userTunnel) {
-            return new UserPermissionResult(false, null, limiter, userTunnel);
+        public static UserPermissionResult success(Integer limiter, UserTunnel userTunnel, boolean admin) {
+            return new UserPermissionResult(false, null, limiter, userTunnel, admin);
         }
 
         public static UserPermissionResult error(String errorMessage) {
-            return new UserPermissionResult(true, errorMessage, null, null);
+            return new UserPermissionResult(true, errorMessage, null, null, false);
         }
     }
 
@@ -2976,6 +3297,15 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
         RepairBudget budget = new RepairBudget();
         for (int portIndex = 0; portIndex < ordered.size(); portIndex++) {
             ForwardPort forwardPort = ordered.get(portIndex);
+            // 一条转发的整轮对账（暂停清理 / 变体重建 / 缺失补齐）必须在同一个下发窗口内完成：
+            // 中途放开，切换就能把节点改成新地址，而本轮后半段又会按旧快照写回去。
+            DdnsDomainGate.Lease ddnsLease = null;
+            if (forwardPort.getForwardId() == null) continue;
+            ForwardWriteLocks.Lease mutationLock = ForwardWriteLocks.tryAcquire(forwardPort.getForwardId());
+            if (mutationLock == null) {
+                notes.add("转发" + forwardPort.getForwardId() + " 正在被编辑或对账，本轮跳过");
+                continue;
+            }
             try {
                 Forward forward = this.getById(forwardPort.getForwardId());
                 if (forward == null) {
@@ -2983,6 +3313,15 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                 }
                 if (!handledForwards.add(forward.getId())) {
                     continue; // 重复端口行只跳过，不打 warn：脏数据不该每轮刷日志
+                }
+                // DDNS 窗口内节点上到底是新值还是旧值无法确定：本轮整条跳过，
+                // 连暂停清理的删除也不做（对账的删除+重建会把节点改回旧地址）。
+                // 必须真取读锁，不能只看标志：标志检查与本轮后续多次下发之间存在窗口。
+                ddnsLease = DdnsTargetRenderer.beginDispatch(forward.getRemoteAddr());
+                if (ddnsLease == null) {
+                    notes.add("转发" + forward.getId()
+                            + " 目标域名正在 DDNS 切换（或有其它下发占用），本轮跳过（不做任何删除/补齐）");
+                    continue;
                 }
                 // status: 1 活跃、0 暂停；暂停的转发不应有在跑的服务，但可能残留旧名条目
                 if (forward.getStatus() != null && forward.getStatus() != 1) {
@@ -3164,6 +3503,11 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                 }
             } catch (RuntimeException e) {
                 notes.add("补齐转发" + forwardPort.getForwardId() + "@node" + nodeId + " 异常：" + e.getMessage());
+            } finally {
+                if (ddnsLease != null) {
+                    ddnsLease.close();
+                }
+                mutationLock.close();
             }
         }
         // 游标推进「本轮真正用掉的额度」：耗满 30 时下一轮正好从第 31 条开始，
@@ -3483,15 +3827,9 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
             String host = "udp".equals(protocol) ? node.getUdpListenAddr() : node.getTcpListenAddr();
             listenAddr = GostUtil.canonicalListenAddr(host) + ":" + forwardPort.getPort();
         }
-        List<String> targets = new ArrayList<>();
-        String remoteAddr = forward.getRemoteAddr();
-        if (remoteAddr != null) {
-            for (String addr : remoteAddr.split(",")) {
-                if (addr != null && !addr.trim().isEmpty()) {
-                    targets.add(addr.trim());
-                }
-            }
-        }
+        // 与 GostUtil.createForwarder 共用同一套渲染：DDNS 域名在这里同样会变成当前 IP。
+        // 两处口径一旦分叉，节点上报的 IP 摘要会永远对不上库里的域名摘要。
+        List<String> targets = GostUtil.renderForwardTargets(forward.getRemoteAddr());
         return GostUtil.normalizeServiceDigestList(listenAddr, protocol, chain, targets);
     }
 
@@ -3753,10 +4091,22 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
         // 链刚补上就重挂：节点若仍占着端口（空清单不实/存量监听起来），每个服务都会 bind 冲突，
         // 连续两次就停手，别把整条隧道下的转发挨个试一遍（QA round46 P1）。
         int rebindBindStreak = 0;
-        for (Forward forward : actives) {
-            if (forward.getTunnelId() == null || forward.getTunnelId().longValue() != tunnelId.longValue()) {
+        for (Forward snapshot : actives) {
+            ForwardWriteLocks.Lease mutationLock = ForwardWriteLocks.tryAcquire(snapshot.getId());
+            if (mutationLock == null) {
+                notes.add("转发" + snapshot.getId() + " 正在修改，跳过本次链路重挂");
                 continue;
             }
+            try {
+                // actives 是锁外快照，等待或抢锁成功后必须重新读取。
+                Forward forward = this.getById(snapshot.getId());
+                if (forward == null || !Objects.equals(forward.getStatus(), 1)
+                        || forward.getTunnelId() == null || forward.getTunnelId().longValue() != tunnelId.longValue()) {
+                    continue;
+                }
+            // 删旧 → 重建全程持有窗口：CreateForwardService 会按注册表渲染 remoteAddr，
+            // 若删完才让切换插进来，渲染抛错时节点上服务已被删掉且不会重建（业务中断）。
+            DdnsDomainGate.Lease rebindLease = null;
             try {
                 ForwardPort forwardPort = forwardPortService.getOne(new QueryWrapper<ForwardPort>()
                         .eq("forward_id", forward.getId()).eq("node_id", nodeId).last("limit 1"));
@@ -3775,6 +4125,13 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                 }
                 String rebindKey = "service|" + nodeId + "|" + name;
                 if (!breakerAllows(rebindKey, nodeId, "重挂入口服务 " + name, notes)) {
+                    continue;
+                }
+                // 必须在删除之前拿到窗口：拿不到就一律不删（删了可能再也建不回来）
+                rebindLease = DdnsTargetRenderer.beginDispatch(forward.getRemoteAddr());
+                if (rebindLease == null) {
+                    notes.add("中继链补齐后重挂入口服务 " + name + "@node" + nodeId
+                            + " 跳过：目标域名正在 DDNS 切换（或有其它下发占用），本次未删除也未重发");
                     continue;
                 }
                 if (!deleteServices(nodeId, name, presentServices, notes)) {
@@ -3800,6 +4157,13 @@ public class ForwardServiceImpl extends ServiceImpl<ForwardMapper, Forward> impl
                 }
             } catch (RuntimeException e) {
                 notes.add("中继链补齐后重挂转发" + forward.getId() + "@node" + nodeId + " 异常：" + e.getMessage());
+            } finally {
+                if (rebindLease != null) {
+                    rebindLease.close();
+                }
+            }
+            } finally {
+                mutationLock.close();
             }
         }
         // 链节点上的中继服务 <tid>_tls 也把链写进了 handler，必须一并重挂

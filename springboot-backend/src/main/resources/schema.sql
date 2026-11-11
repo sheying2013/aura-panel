@@ -132,4 +132,20 @@ CREATE TABLE IF NOT EXISTS flow_report_dedup (
   bucket BIGINT NOT NULL,
   created_time BIGINT NOT NULL
 );
-
+-- DDNS：目标域名的当前解析状态。独立成表，不改 forward 既有列，老库启动时由
+-- CREATE TABLE IF NOT EXISTS 自动补齐。
+CREATE TABLE IF NOT EXISTS ddns_record (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain VARCHAR(253) NOT NULL,
+  resolved_ips TEXT NOT NULL DEFAULT '',
+  primary_ip VARCHAR(64) NOT NULL DEFAULT '',
+  interval_seconds INTEGER NOT NULL DEFAULT 60,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_check_time INTEGER NOT NULL DEFAULT 0,
+  last_change_time INTEGER NOT NULL DEFAULT 0,
+  last_error VARCHAR(512) NOT NULL DEFAULT '',
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  created_time INTEGER NOT NULL DEFAULT 0,
+  updated_time INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_ddns_record_domain ON ddns_record(domain);

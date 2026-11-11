@@ -14,6 +14,7 @@ import com.admin.service.ForwardService;
 import com.admin.service.NodeService;
 import com.admin.service.ChainTunnelService;
 import com.admin.common.utils.GostUtil;
+import com.admin.common.utils.ResourceLifecycleLocks;
 import com.admin.common.utils.WebSocketServer;
 import com.admin.entity.Forward;
 import com.admin.entity.Tunnel;
@@ -220,6 +221,17 @@ public class UserTunnelServiceImpl extends ServiceImpl<UserTunnelMapper, UserTun
         if (updateDto.getId() == null) {
             return R.err("权限ID不能为空");
         }
+        ResourceLifecycleLocks.Lease lease = ResourceLifecycleLocks.acquire(
+                ResourceLifecycleLocks.CREATE_WAIT_MILLIS, ResourceLifecycleLocks.userTunnelKey(updateDto.getId()));
+        if (lease == null) return R.err("隧道权限正在更新，请稍后重试");
+        try {
+            return updateUserTunnelLocked(updateDto);
+        } finally {
+            lease.close();
+        }
+    }
+
+    private R updateUserTunnelLocked(UserTunnelUpdateDto updateDto) {
         UserTunnel userTunnel = this.getById(updateDto.getId());
         if (userTunnel == null) return R.err("未找到对应的用户隧道权限记录");
         // 引用与归属校验必须在写库之前：speed_id 指向不存在或跨隧道的规则时，节点侧限流器查不到对象，限速会静默失效

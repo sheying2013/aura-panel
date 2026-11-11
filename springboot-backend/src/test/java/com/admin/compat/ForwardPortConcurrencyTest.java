@@ -6,6 +6,7 @@ import com.admin.common.lang.R;
 import com.admin.config.ForwardPortUniqueMigration;
 import com.admin.entity.ChainTunnel;
 import com.admin.entity.Forward;
+import com.admin.entity.User;
 import com.admin.entity.ForwardPort;
 import com.admin.entity.Node;
 import com.admin.entity.Tunnel;
@@ -124,7 +125,13 @@ class ForwardPortConcurrencyTest {
         ReflectionTestUtils.setField(forwardService, "chainTunnelService", chainTunnelService);
         ReflectionTestUtils.setField(forwardService, "nodeService", nodeService);
         ReflectionTestUtils.setField(forwardService, "forwardPortService", forwardPortService);
-        ReflectionTestUtils.setField(forwardService, "userService", mock(UserService.class));
+        // checkUserPermissions 持锁后先重读账号行：管理员替身必须能从库里读到一条 role_id=0 的行，否则按账号不存在拒绝。
+        UserService stubbedUserService = mock(UserService.class);
+        User stubbedAdminRow = new User();
+        stubbedAdminRow.setId((long) USER_ID);
+        stubbedAdminRow.setRoleId(0);
+        when(stubbedUserService.getById(any())).thenReturn(stubbedAdminRow);
+        ReflectionTestUtils.setField(forwardService, "userService", stubbedUserService);
         ReflectionTestUtils.setField(forwardService, "userTunnelService", mock(UserTunnelService.class));
 
         // 每条转发一个自增 id：并发创建拿到不同 forward_id，端口占用查询才不会把别人的行当成自己的
