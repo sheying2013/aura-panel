@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -39,6 +41,37 @@ func SetHTTPReportURL(addr string, secret string) {
 	} else {
 		fmt.Printf("🔐 HTTP AES 加密器创建成功\n")
 	}
+}
+
+// reportHTTPError 包装上报请求失败的原因，但不携带请求 URL。
+// 上报 URL 的 query 中含有 secret，不能被写入日志或返回给调用方。
+type reportHTTPError struct {
+	op  string
+	err error
+}
+
+func (e *reportHTTPError) Error() string {
+	if e.err == nil {
+		return e.op + " 请求失败"
+	}
+	if e.op == "" {
+		return e.err.Error()
+	}
+	return e.op + " 请求失败: " + e.err.Error()
+}
+
+func (e *reportHTTPError) Unwrap() error {
+	return e.err
+}
+
+// sanitizeReportURLError 去掉 net/http 错误中的 URL（其中带有 secret），
+// 保留底层原因，使 errors.Is/errors.As 仍然可用。
+func sanitizeReportURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return &reportHTTPError{op: urlErr.Op, err: sanitizeReportURLError(urlErr.Err)}
+	}
+	return err
 }
 
 // sendBatchTrafficReport 批量发送多个服务的流量报告到HTTP接口
@@ -75,7 +108,7 @@ func sendBatchTrafficReport(ctx context.Context, reportItems []TrafficReportItem
 
 	req, err := http.NewRequestWithContext(ctx, "POST", httpReportURL, bytes.NewBuffer(requestBody))
 	if err != nil {
-		return false, fmt.Errorf("创建HTTP请求失败: %v", err)
+		return false, fmt.Errorf("创建HTTP请求失败: %w", sanitizeReportURLError(err))
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -87,7 +120,7 @@ func sendBatchTrafficReport(ctx context.Context, reportItems []TrafficReportItem
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("发送HTTP请求失败: %v", err)
+		return false, fmt.Errorf("发送HTTP请求失败: %w", sanitizeReportURLError(err))
 	}
 	defer resp.Body.Close()
 
@@ -111,7 +144,6 @@ func sendBatchTrafficReport(ctx context.Context, reportItems []TrafficReportItem
 		return false, fmt.Errorf("服务器响应: %s (期望: ok)", responseText)
 	}
 }
-
 
 // sendConfigReport 发送配置报告到HTTP接口
 func sendConfigReport(ctx context.Context) (bool, error) {
@@ -152,7 +184,7 @@ func sendConfigReport(ctx context.Context) (bool, error) {
 
 	req, err := http.NewRequestWithContext(ctx, "POST", configReportURL, bytes.NewBuffer(requestBody))
 	if err != nil {
-		return false, fmt.Errorf("创建HTTP请求失败: %v", err)
+		return false, fmt.Errorf("创建HTTP请求失败: %w", sanitizeReportURLError(err))
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -164,7 +196,7 @@ func sendConfigReport(ctx context.Context) (bool, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("发送HTTP请求失败: %v", err)
+		return false, fmt.Errorf("发送HTTP请求失败: %w", sanitizeReportURLError(err))
 	}
 	defer resp.Body.Close()
 
