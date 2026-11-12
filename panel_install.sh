@@ -524,7 +524,7 @@ show_menu() {
     clear
     echo -e "${BOLD}${CYAN}========================================================${RESET}"
     echo -e "${BOLD}${CYAN}             Aura Panel 运维管理控制台                  ${RESET}"
-    echo -e "${BOLD}${CYAN}   分布式端口转发与多跳隧道中继管理系统 | v2.1.1        ${RESET}"
+    echo -e "${BOLD}${CYAN}   分布式端口转发与多跳隧道中继管理系统 | v2.1.2        ${RESET}"
     echo -e "${BOLD}${CYAN}========================================================${RESET}"
     echo -e " 1. 安装 Aura Panel (Docker 傻瓜式一键安装)"
     echo -e " 2. 启动服务 (Start)"

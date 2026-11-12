@@ -14,7 +14,7 @@ INSTALL_DIR="/opt/aura-panel"
 AGENT_INSTALL_DIR="/etc/aura_agent"
 LEGACY_AGENT_DIR="/etc/flux_agent"
 REPO_OWNER="sheying2013"
-VERSION="v2.1.1"
+VERSION="v2.1.2"
 
 # 颜色定义
 RED="\033[31m"
@@ -204,7 +204,7 @@ fi
 if [[ -t 0 ]]; then
     echo -e "${BOLD}${CYAN}========================================================${RESET}"
     echo -e "${BOLD}${CYAN}            Aura Panel 全功能统一安装管理               ${RESET}"
-    echo -e "${BOLD}${CYAN}   分布式端口转发与多跳隧道中继管理系统 | v2.1.1        ${RESET}"
+    echo -e "${BOLD}${CYAN}   分布式端口转发与多跳隧道中继管理系统 | v2.1.2        ${RESET}"
     echo -e "${BOLD}${CYAN}========================================================${RESET}"
     echo -e " 1. 安装 Aura Panel Web 管理控制台 (Docker 傻瓜式一键安装)"
     echo -e " 2. 安装 / 对接 Agent 转发节点 (需先有面板并提供密钥)"
