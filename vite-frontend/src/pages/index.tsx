@@ -3,6 +3,7 @@ import { Input } from "@heroui/input";
 import { Card, CardBody, CardHeader } from "@heroui/card";
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
+import { loginValidationErrors } from "./loginValidation";
 import toast from 'react-hot-toast';
 import axios from 'axios';
 import { isWebViewFunc } from '@/utils/panel';
@@ -68,19 +69,7 @@ export default function IndexPage() {
   }, []);
   // 验证表单
   const validateForm = (): boolean => {
-    const newErrors: Partial<LoginForm> = {};
-
-    if (!form.username.trim()) {
-      newErrors.username = '请输入用户名';
-    }
-
-    if (!form.password.trim()) {
-      newErrors.password = '请输入密码';
-    } else if (form.password.length < 6) {
-      newErrors.password = '密码长度至少6位';
-    }
-
-
+    const newErrors = loginValidationErrors(form.username, form.password);
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -291,6 +280,7 @@ export default function IndexPage() {
                   variant="bordered"
                   isDisabled={loading}
                   isInvalid={!!errors.password}
+                  errorMessage={errors.password}
                   classNames={{
                     label: "text-[#a9a49b]",
                     inputWrapper: "bg-white/[0.03] border-white/[0.1] hover:border-[#c8b89a]/40 focus-within:!border-[#c8b89a] text-[#e6e6e6]",
