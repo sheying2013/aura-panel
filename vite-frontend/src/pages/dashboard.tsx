@@ -1,14 +1,28 @@
 import { Button } from "@heroui/button";
 import { Modal, ModalContent, ModalHeader, ModalBody } from "@heroui/modal";
-import { useState, useEffect } from "react";
+import { useRef, useState, useEffect } from "react";
 import toast from 'react-hot-toast';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
-import { getUserPackageInfo } from "@/api";
 import Network from '@/api/network';
 
-import { NODE_STATUS_ORDER, nodeHealthStatusOf, resolveNodeHealthCounts } from './nodeHealthView';
-import type { NodeHealthStatus, NodeHealthSummary } from './nodeHealthView';
+import {
+  NODE_STATUS_ORDER,
+  applyNodeHealthFreshness,
+  createNodeHealthPoller,
+  interpretNodeHealthResponse,
+  nodeHealthStatusOf,
+  resolveNodeHealthCounts,
+  subscribeNodeHealthWake,
+} from './nodeHealthView';
+import type {
+  NodeHealthNode,
+  NodeHealthPoller,
+  NodeHealthSnapshot,
+  NodeHealthState,
+  NodeHealthStatus,
+  NodeHealthSummary,
+} from './nodeHealthView';
 
 interface UserInfo {
   flow: number;
@@ -69,6 +83,126 @@ const NODE_STATUS_META: Record<NodeHealthStatus, { label: string; tile: string; 
   UNKNOWN: { label: '未知', tile: 'bg-white/[0.04] border-dashed border-white/20 hover:border-[#c8b89a]/60', dot: 'bg-white/30', text: 'text-[#8a857c]' },
 };
 
+/** 历史容量不足时直接显示说明，不依赖悬停或颜色。 */
+export const NodeHealthCapacityNotice = ({ nodes }: { nodes: readonly NodeHealthNode[] }) => {
+  const count = nodes.filter((node) => node.localHistoryCapacityExceeded === true).length;
+  if (count === 0) return null;
+  return (
+    <p role="status" tabIndex={0} className="mt-2 rounded border border-[#e0b84f]/40 bg-[#e0b84f]/10 p-3 text-sm text-[#f5dfa5]">
+      节点健康历史容量已满，{count} 个节点状态按未知显示。页面重载会清空本页历史，首次收到的旧缓存可能无法识别；重载后若节点仍超过容量，部分节点仍将显示未知。
+    </p>
+  );
+};
+
+// ========== 身份快照：登录/退出可能发生在别的标签页 ==========
+// 只做身份核对，不猜服务端状态：浏览器侧能观察到的只有 localStorage 里的 token / admin / role_id。
+
+/** 浏览器侧能看到的身份三件套 */
+export interface IdentitySnapshot {
+  token: string | null;
+  /** 登录时服务端写入的兼容标记；老会话可能没有这个字段 */
+  admin: string | null;
+  roleId: string | null;
+}
+
+/** 身份指纹：token 与 admin/role_id 任一变化都算换了账号 */
+export const identityKeyOf = (identity: IdentitySnapshot): string =>
+  JSON.stringify([identity.token, identity.admin, identity.roleId]);
+
+/** 读出当前身份；写入方与登录页、管理端布局保持一致 */
+export const readIdentitySnapshot = (storage: Pick<Storage, 'getItem'>): IdentitySnapshot => ({
+  token: storage.getItem('token'),
+  admin: storage.getItem('admin'),
+  roleId: storage.getItem('role_id'),
+});
+
+/** 管理员必须有 token；任一角色标记明确非管理员或两者冲突时保守拒绝。 */
+export const isAdminIdentity = (identity: IdentitySnapshot): boolean => {
+  if (!identity.token?.trim()) return false;
+  if (identity.admin !== null && identity.admin !== 'true') return false;
+  if (identity.roleId !== null && identity.roleId !== '0') return false;
+  return identity.admin === 'true' || identity.roleId === '0';
+};
+
+/** storage 事件里只有这三个键会改变身份（key 为 null 表示整体被 clear） */
+export const isIdentityStorageKey = (key: string | null): boolean =>
+  key === null || key === 'token' || key === 'admin' || key === 'role_id';
+
+export interface IdentityWatchOptions {
+  read: () => IdentitySnapshot;
+  onChange: (nextKey: string, previousKey: string) => void;
+  /** 订阅时已知的指纹：只有真的变了才回调 */
+  initialKey?: string;
+  win?: Pick<Window, 'addEventListener' | 'removeEventListener'>;
+  doc?: Pick<Document, 'addEventListener' | 'removeEventListener' | 'visibilityState'>;
+}
+
+/**
+ * 身份变化订阅。
+ *
+ * <p>跨标签页：storage 事件（别的标签页登录/退出只改 localStorage，不会重挂载本页）。
+ * <p>页内恢复：从 bfcache 返回时 storage 补不到，pageshow / visibilitychange 时再主动核对一次。
+ * <p>同标签页的登录/退出本身就会让路由重挂载本页，不需要额外事件；同 token 重新登录
+ * （服务端换了账号但 token 没变）浏览器侧没有任何信号，这里检测不到，只能靠请求失败兜底。
+ *
+ * <p>返回退订函数，卸载时必须调用。
+ */
+export const watchIdentity = (options: IdentityWatchOptions): (() => void) => {
+  const { read, onChange, initialKey } = options;
+  const win = options.win ?? (typeof window === 'undefined' ? null : window);
+  const doc = options.doc ?? (typeof document === 'undefined' ? null : document);
+
+  if (!win || !doc) return () => {};
+
+  let lastKey = initialKey ?? identityKeyOf(read());
+
+  const sync = () => {
+    const nextKey = identityKeyOf(read());
+
+    if (nextKey === lastKey) return;
+    const previousKey = lastKey;
+
+    lastKey = nextKey;
+    onChange(nextKey, previousKey);
+  };
+
+  const onStorage = (event: StorageEvent) => {
+    if (isIdentityStorageKey(event.key)) sync();
+  };
+  // 只有回到前台才核对，标签页隐藏期间不动
+  const onVisibility = () => {
+    if (doc.visibilityState === 'visible') sync();
+  };
+
+  win.addEventListener('storage', onStorage);
+  win.addEventListener('pageshow', sync);
+  doc.addEventListener('visibilitychange', onVisibility);
+  // 补上 render 与监听安装之间发生的身份变更。
+  sync();
+
+  return () => {
+    win.removeEventListener('storage', onStorage);
+    win.removeEventListener('pageshow', sync);
+    doc.removeEventListener('visibilitychange', onVisibility);
+  };
+};
+
+/** 换身份：旧账号的摘要与时间基准一起作废，绝不留在线结论 */
+export const clearNodeHealthSnapshot = (prev: NodeHealthSnapshot): NodeHealthSnapshot => ({
+  state: 'idle',
+  summary: null,
+  error: '',
+  fetchedAt: null,
+  basis: null,
+  version: prev.version + 1,
+});
+
+/** 非管理员：不发管理员摘要请求，只留拒绝态 */
+export const denyNodeHealthSnapshot = (prev: NodeHealthSnapshot): NodeHealthSnapshot => ({
+  ...clearNodeHealthSnapshot(prev),
+  state: 'denied',
+});
+
 export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -82,14 +216,31 @@ export default function DashboardPage() {
   const [addressList, setAddressList] = useState<AddressItem[]>([]);
 
   // 节点健康摘要：/api/v1/node/health/summary 带 @RequireRole，仅 role_id=0 的管理员可读，非管理员不发起请求
-  const [nodeHealth, setNodeHealth] = useState<NodeHealthSummary | null>(null);
-  const [nodeHealthState, setNodeHealthState] = useState<'idle' | 'loading' | 'ready' | 'error' | 'denied'>('idle');
-  const [nodeHealthError, setNodeHealthError] = useState('');
-  const isAdmin = (() => {
-    const flag = localStorage.getItem('admin');
-    if (flag !== null) return flag === 'true';
-    return parseInt(localStorage.getItem('role_id') || '1', 10) === 0;
-  })();
+  // 一份快照就是一份真相：状态、摘要、报错、时间基准、版本一起换；
+  // 到期定时器只递增版本，界面也会跟着按当前时刻重算（不必等下一次读取）
+  const [nodeHealthSnapshot, setNodeHealthSnapshot] = useState<NodeHealthSnapshot>({
+    state: 'idle',
+    summary: null,
+    error: '',
+    fetchedAt: null,
+    basis: null,
+    version: 0,
+  });
+  const nodeHealth = nodeHealthSnapshot.summary;
+  const nodeHealthState: NodeHealthState = nodeHealthSnapshot.state;
+  const nodeHealthError = nodeHealthSnapshot.error;
+  // 只读摘要轮询器：跨渲染复用同一个实例，卸载时停表
+  const nodeHealthPollerRef = useRef<NodeHealthPoller | null>(null);
+  // 页面生命周期内的取消令牌：卸载（含 StrictMode 重挂载）时中断在途的 /user/package
+  const packageAbortRef = useRef<AbortController | null>(null);
+  // 请求代次：多次刷新重叠时，只有最新一次响应可以回写界面
+  const packageRequestSeqRef = useRef(0);
+  // 手工刷新代次：被取代的刷新不再提示、不再改 refreshing
+  const refreshSeqRef = useRef(0);
+  // 身份指纹：另一标签页登录/退出只改 localStorage，这里一变就整段重装
+  const [identityKey, setIdentityKey] = useState(() => identityKeyOf(readIdentitySnapshot(localStorage)));
+  // 即使同一批次先后切换回原身份，也要重建已停止的请求作用域。
+  const [identityScopeRevision, setIdentityScopeRevision] = useState(0);
 
   // 检查有效期通知
   const checkExpirationNotifications = (info: UserInfo, tunnels: UserTunnel[]) => {
@@ -124,15 +275,110 @@ export default function DashboardPage() {
     }
   };
 
+  // 身份一变（另一标签页登录/退出、bfcache 或可见性恢复）就换 key，这一段整体重跑：
+  // 停表作废旧请求 → 清掉上一账号数据 → 按当前身份重新装载。
   useEffect(() => {
-    loadPackageData();
-    loadNodeHealth();
-    localStorage.setItem('e', '/dashboard');
-  }, []);
+    const identity = readIdentitySnapshot(localStorage);
+    // 身份在 render 和 effect 之间变化时，等待 watcher 切换 key，绝不使用旧作用域发请求。
+    if (identityKeyOf(identity) !== identityKey) return;
+    const controller = new AbortController();
+    packageAbortRef.current = controller;
+    let poller: NodeHealthPoller | null = null;
 
-  const loadPackageData = async () => {
+    const stopIdentityScope = () => {
+      // 先作废代次再中断：即使底层没抛 AbortError，迟到的旧账号回调也不能写状态
+      packageRequestSeqRef.current += 1;
+      refreshSeqRef.current += 1;
+      if (packageAbortRef.current === controller) {
+        packageAbortRef.current = null;
+      }
+      controller.abort();
+      poller?.stop();
+      if (poller && nodeHealthPollerRef.current === poller) {
+        nodeHealthPollerRef.current = null;
+      }
+    };
+
+    // 上一账号的套餐/隧道/转发/流量一律不能留在页面上，管理员摘要同样清空
+    setUserInfo({} as UserInfo);
+    setUserTunnels([]);
+    setForwardList([]);
+    setStatisticsFlows([]);
+    setLoading(true);
+    setRefreshing(false);
+    setNodeHealthSnapshot(clearNodeHealthSnapshot);
+    setAddressModalOpen(false);
+    setAddressModalTitle('');
+    setAddressList([]);
+    if (!identity.token?.trim()) {
+      setLoading(false);
+      return stopIdentityScope;
+    }
+
+    void loadPackageData();
+    localStorage.setItem('e', '/dashboard');
+
+    if (!isAdminIdentity(identity)) {
+      // 非管理员不读管理员摘要：上面已清空，这里只留拒绝态
+      setNodeHealthSnapshot(denyNodeHealthSnapshot);
+      return stopIdentityScope;
+    }
+
+    // 首次读取 + 每分钟只读刷新；接口只返回后端最近一次探测结论，浏览器侧不发起任何探测
+    poller = nodeHealthPoller();
+    void poller.refresh({ showLoading: true });
+    poller.start();
+    // 卸载时停表并作废在途结果，避免卸载后仍把旧在线写回界面
+    return stopIdentityScope;
+  }, [identityKey, identityScopeRevision]);
+
+  // 另一标签页登录/退出不会重挂载本页：靠 storage 感知，bfcache/可见性恢复时再核对一次
+  useEffect(() => {
+    return watchIdentity({
+      initialKey: identityKey,
+      read: () => readIdentitySnapshot(localStorage),
+      onChange: (nextKey) => {
+        // 在 React 重新提交新身份前同步终止旧作用域，并作废全部异步回写。
+        packageRequestSeqRef.current += 1;
+        refreshSeqRef.current += 1;
+        packageAbortRef.current?.abort();
+        packageAbortRef.current = null;
+        nodeHealthPollerRef.current?.stop();
+        nodeHealthPollerRef.current = null;
+        setUserInfo({} as UserInfo);
+        setUserTunnels([]);
+        setForwardList([]);
+        setStatisticsFlows([]);
+        setAddressModalOpen(false);
+        setAddressModalTitle('');
+        setAddressList([]);
+        setNodeHealthSnapshot(clearNodeHealthSnapshot);
+        setRefreshing(false);
+        setLoading(true);
+        setIdentityKey(nextKey);
+        setIdentityScopeRevision((revision) => revision + 1);
+      },
+    });
+  }, [identityKey]);
+
+  // 可取消的只读 POST：旧 Network.post 遇 401 不会 settle，且会用旧 token 误清当前会话
+  const loadPackageData = async (): Promise<boolean> => {
+    const controller = packageAbortRef.current;
+    // 页面已卸载 / 尚未挂载：不发请求，也不写任何状态
+    const identity = readIdentitySnapshot(localStorage);
+    if (!controller || controller.signal.aborted || !identity.token?.trim() || identityKeyOf(identity) !== identityKey) return false;
+
+    const requestSeq = ++packageRequestSeqRef.current;
+    // 仍是最新一次请求且页面未卸载时才允许回写；旧响应一律丢弃
+    const canWrite = () =>
+      packageAbortRef.current === controller &&
+      packageRequestSeqRef.current === requestSeq &&
+      !controller.signal.aborted &&
+      identityKeyOf(readIdentitySnapshot(localStorage)) === identityKey;
+
     try {
-      const res = await getUserPackageInfo();
+      const res = await Network.postCancellable<any>('/user/package', {}, { signal: controller.signal });
+      if (!canWrite()) return false;
       if (res.code === 0) {
         const data = res.data;
         setUserInfo(data.userInfo || {});
@@ -145,50 +391,58 @@ export default function DashboardPage() {
       console.error('获取面板数据失败:', res.msg);
       return false;
     } catch (error) {
+      if (!canWrite()) return false;
       console.error('获取面板数据失败:', error);
       return false;
     } finally {
-      setLoading(false);
+      if (canWrite()) setLoading(false);
     }
   };
 
-  // 只读取后端最近一次控制通道往返检测的结果，不在浏览器侧发起任何探测；页面刷新也不会重新检测
-  const loadNodeHealth = async () => {
-    if (!isAdmin) {
-      setNodeHealthState('denied');
-      return true; // 普通用户无需请求管理员接口
+  // 只读取后端最近一次控制通道往返检测的结果，不在浏览器侧发起任何探测
+  const nodeHealthPoller = (): NodeHealthPoller => {
+    const existing = nodeHealthPollerRef.current;
+
+    if (existing) {
+      return existing;
     }
-    setNodeHealthState('loading');
-    setNodeHealthError('');
-    try {
-      const res = await Network.post<NodeHealthSummary | null>('/node/health/summary');
-      if (res.code === 0) {
-        if (!res.data || !Array.isArray(res.data.nodes)) {
-          setNodeHealth(null);
-          setNodeHealthError('后端未返回 nodes 数组');
-          setNodeHealthState('error');
-          return false;
+    const created = createNodeHealthPoller({
+      // 可取消的只读 POST：卸载/超时时中断请求；401/403 返回明确结果
+      read: async (signal) => {
+        const identity = readIdentitySnapshot(localStorage);
+        if (identityKeyOf(identity) !== identityKey || !isAdminIdentity(identity)) {
+          return { ok: false, denied: true, message: '当前身份不可读取节点健康摘要' };
         }
-        setNodeHealth(res.data);
-        setNodeHealthState('ready');
-        return true;
-      } else if (res.code === 403) {
-        setNodeHealth(null);
-        setNodeHealthState('denied');
-      } else {
-        setNodeHealth(null);
-        setNodeHealthError(res.msg || '未知错误');
-        setNodeHealthState('error');
-      }
-    } catch (error) {
-      setNodeHealth(null);
-      setNodeHealthError(error instanceof Error ? error.message : '网络请求失败');
-      setNodeHealthState('error');
-    }
-    return false;
+        return interpretNodeHealthResponse(
+          await Network.postCancellable<NodeHealthSummary | null>('/node/health/summary', {}, { signal }),
+        );
+      },
+      onChange: (snapshot) => {
+        if (identityKeyOf(readIdentitySnapshot(localStorage)) === identityKey) setNodeHealthSnapshot(snapshot);
+      },
+      // 切回标签页/窗口重新聚焦时立刻重新验证，别让被压低的定时器把旧结论留在页面上
+      subscribeWake: subscribeNodeHealthWake,
+    });
+
+    nodeHealthPollerRef.current = created;
+    return created;
   };
 
-  const formatCheckedAt = (checkedAt?: number | null): string => {
+  // 读取失败/被拒时轮询器会把摘要清空，这里不会留下上一次的在线结论
+  const loadNodeHealth = (options?: { showLoading?: boolean }): Promise<boolean> => {
+    // 按调用时的身份判定，不信任渲染时的旧快照
+    const identity = readIdentitySnapshot(localStorage);
+    if (identityKeyOf(identity) !== identityKey || !isAdminIdentity(identity)) {
+      setNodeHealthSnapshot(denyNodeHealthSnapshot);
+      return Promise.resolve(true); // 普通用户无需请求管理员接口
+    }
+    return nodeHealthPoller().refresh(options);
+  };
+
+  // 服务器已按服务器时间格式化好 checkedAtText：原样展示，不拿本机时钟/时区重新解释服务器时刻
+  const formatCheckedAt = (node: Pick<NodeHealthNode, 'checkedAt' | 'checkedAtText'>): string => {
+    if (node.checkedAtText) return node.checkedAtText;
+    const checkedAt = node.checkedAt;
     if (checkedAt == null) return '时间未知';
     const time = new Date(checkedAt);
     if (isNaN(time.getTime())) return '时间无效';
@@ -198,9 +452,16 @@ export default function DashboardPage() {
 
   // 摘要接口只读；刷新最新结果不会触发新的节点探测
   const handleRefresh = async () => {
+    const refreshSeq = ++refreshSeqRef.current;
+    // 页面已卸载或本次刷新已被更新的刷新取代：不再提示、不再写 refreshing
+    const canWrite = () => {
+      const controller = packageAbortRef.current;
+      return refreshSeq === refreshSeqRef.current && !!controller && !controller.signal.aborted;
+    };
     setRefreshing(true);
     try {
-      const [packageOk, nodeHealthOk] = await Promise.all([loadPackageData(), loadNodeHealth()]);
+      const [packageOk, nodeHealthOk] = await Promise.all([loadPackageData(), loadNodeHealth({ showLoading: true })]);
+      if (!canWrite()) return;
       if (packageOk && nodeHealthOk) {
         toast.success("数据已刷新", {
           style: { background: '#141414', color: '#c8b89a', border: '1px solid rgba(200,184,154,0.25)' }
@@ -209,7 +470,7 @@ export default function DashboardPage() {
         toast.error("部分数据刷新失败，请重试");
       }
     } finally {
-      setRefreshing(false);
+      if (canWrite()) setRefreshing(false);
     }
   };
 
@@ -511,13 +772,24 @@ export default function DashboardPage() {
     return (forward.inFlow || 0) + (forward.outFlow || 0);
   };
 
-  const nodeHealthNodes = nodeHealth?.nodes ?? [];
+  // 后端有效期兜底：结论年龄只用「服务器时间差 + 本机实测往返/单调耗时」推算，
+  // 不拿本机 Date.now 减服务器 checkedAt（跨时钟偏差会把刚检测完的在线判成过期）
+  const nodeHealthNodes = applyNodeHealthFreshness(
+    nodeHealth?.nodes ?? [],
+    nodeHealth?.freshnessMs,
+    nodeHealthSnapshot.basis,
+  );
   // 统计与明细同源：有明细就按明细重算，过期结论落进未知并单独记 staleCount
   const healthCounts = resolveNodeHealthCounts(nodeHealth, nodeHealthNodes);
   const healthTotal = healthCounts.total;
   const healthOnline = healthCounts.online;
   const healthUnknown = healthCounts.unknown;
   const healthStale = healthCounts.staleCount;
+
+  const renderIdentity = readIdentitySnapshot(localStorage);
+  if (!renderIdentity.token?.trim() || identityKeyOf(renderIdentity) !== identityKey) {
+    return <div className="px-3 lg:px-6 pt-4 text-[#888]">请登录后查看仪表板</div>;
+  }
 
   if (loading) {
     return (
@@ -656,6 +928,7 @@ export default function DashboardPage() {
           </span>
         </div>
 
+        {nodeHealthState === 'ready' && <NodeHealthCapacityNotice nodes={nodeHealthNodes} />}
         {nodeHealthState === 'ready' && nodeHealth?.stateHealthy === false && (
           <p role="alert" className="pt-2 text-[11px] text-[#c89a9a]">检测状态保存异常，自动检测可能暂停；请检查面板日志及数据目录权限。</p>
         )}
@@ -674,7 +947,7 @@ export default function DashboardPage() {
         ) : nodeHealthState === 'error' ? (
           <div className="flex items-center justify-between gap-3 py-3 text-[11px] font-mono">
             <span className="text-[#c89a9a] truncate">节点健康摘要读取失败：{nodeHealthError}</span>
-            <Button className="text-[#c8b89a] text-xs h-7 px-2 shrink-0" size="sm" variant="light" onClick={loadNodeHealth}>重试</Button>
+            <Button className="text-[#c8b89a] text-xs h-7 px-2 shrink-0" size="sm" variant="light" onClick={() => { void loadNodeHealth({ showLoading: true }); }}>重试</Button>
           </div>
         ) : nodeHealthNodes.length === 0 ? (
           <div className="flex items-center gap-2 py-3 text-[11px] font-mono text-[#8a857c]">
@@ -695,7 +968,7 @@ export default function DashboardPage() {
                     <div
                       key={node.nodeId}
                       className={`w-6 h-6 rounded-[5px] border cursor-help transition-colors ${meta.tile}`}
-                      title={`${node.nodeName || '未命名节点'} · ${meta.label} · 检测 ${formatCheckedAt(node.checkedAt)}${history}${node.detail ? ` · ${node.detail}` : ''} · ID ${node.nodeId}`}
+                      title={`${node.nodeName || '未命名节点'} · ${meta.label} · 检测 ${formatCheckedAt(node)}${history}${node.detail ? ` · ${node.detail}` : ''} · ID ${node.nodeId}`}
                     />
                   );
                 })}
@@ -709,7 +982,7 @@ export default function DashboardPage() {
                     </span>
                   ))}
                 </div>
-                <span className="text-[#555]">显示最近一次控制通道检测 · 非业务链路 · 刷新不触发检测</span>
+                <span className="text-[#555]">显示最近一次控制通道检测 · 每分钟只读摘要 · 读取不触发检测 · 结论过期自动转未知</span>
               </div>
             </div>
 
@@ -730,7 +1003,7 @@ export default function DashboardPage() {
                       {node.stale && <span className="text-[#e0b84f] shrink-0">旧结果</span>}
                     </span>
                     <span className="text-[#8a857c] shrink-0">
-                      {node.stale ? '上次 ' : ''}{formatCheckedAt(node.checkedAt)}
+                      {node.stale ? '上次 ' : ''}{formatCheckedAt(node)}
                     </span>
                   </div>
                 );
@@ -902,7 +1175,7 @@ export default function DashboardPage() {
             <h2 className="text-sm lg:text-base font-medium text-[#e6e6e6] tracking-wide">转发规则监控</h2>
           </div>
           <span className="px-2.5 py-0.5 bg-[#c8b89a]/10 text-[#c8b89a] border border-[#c8b89a]/25 rounded text-xs font-mono">
-            {forwardList.length} 规则在线
+            {forwardList.length} 条转发规则
           </span>
         </div>
 
