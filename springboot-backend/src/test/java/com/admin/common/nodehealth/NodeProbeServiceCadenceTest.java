@@ -50,6 +50,44 @@ class NodeProbeServiceCadenceTest {
     private static final long ONE_HOUR = 60L * 60L * 1000L;
 
     @Test
+    void emptyListDoesNotConsumeWindowEvenAcrossRestart() {
+        MutableClock clock = new MutableClock(T0);
+        NodeService nodeService = mock(NodeService.class);
+        when(nodeService.list()).thenReturn(Collections.emptyList(), Collections.singletonList(node(1L)));
+        NodeProbeTransport transport = mock(NodeProbeTransport.class);
+        when(transport.probe(1L)).thenReturn(NodeProbeTransport.Reply.ok(5L, "OK"));
+        NodeProbeStateStore store = org.mockito.Mockito.spy(new InMemoryNodeProbeStateStore());
+
+        NodeProbeService first = new NodeProbeService(nodeService, transport, id -> true, clock, INTERVAL, FRESH, store);
+        assertTrue(first.probeIfDue("empty").isEmpty());
+        assertNull(first.lastRound());
+        assertNull(first.nextDueAt());
+        verify(store, org.mockito.Mockito.never()).save(org.mockito.ArgumentMatchers.any());
+        verifyNoInteractions(transport);
+
+        NodeProbeService restarted = new NodeProbeService(nodeService, transport, id -> true, clock, INTERVAL, FRESH, store);
+        assertTrue(restarted.probeIfDue("node-added").isPresent());
+        assertEquals(NodeProbeStatus.ONLINE, restarted.effective(1L).status());
+        assertEquals(Long.valueOf(T0 + INTERVAL), restarted.nextDueAt());
+        assertTrue(restarted.probeIfDue("too-soon").isEmpty());
+        verify(transport, times(1)).probe(1L);
+        verify(store, times(2)).save(org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void nullNodeListRemainsAnErrorAndDoesNotReserve() {
+        NodeService nodeService = mock(NodeService.class);
+        when(nodeService.list()).thenReturn(null);
+        NodeProbeTransport transport = mock(NodeProbeTransport.class);
+        NodeProbeStateStore store = org.mockito.Mockito.spy(new InMemoryNodeProbeStateStore());
+        NodeProbeService service = new NodeProbeService(nodeService, transport, id -> true,
+                new MutableClock(T0), INTERVAL, FRESH, store);
+        assertThrows(NodeHealthDataException.class, () -> service.probeIfDue("broken-list"));
+        verify(store, org.mockito.Mockito.never()).save(org.mockito.ArgumentMatchers.any());
+        verifyNoInteractions(transport);
+    }
+
+    @Test
     void restartKeepsTheTwelveHourWindow() throws Exception {
         Path dir = newWorkDir("cadence-restart-");
         FileNodeProbeStateStore store = new FileNodeProbeStateStore(dir.resolve("node-probe-state.json"));

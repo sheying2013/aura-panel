@@ -311,6 +311,10 @@ public class NodeProbeService {
             }
 
             List<Node> nodes = requireNodes();
+            // 空快照没有任何节点可探测，不应消耗整个全局检测窗口。
+            if (nodes.isEmpty()) {
+                return Optional.empty();
+            }
             // 开一轮之前先丢掉「节点已不存在 / ID 被复用」的旧结论：账本因此有界，
             // 新建的节点也不会继承上一个同 ID 节点的在线结论
             pruneResults(nodes);
