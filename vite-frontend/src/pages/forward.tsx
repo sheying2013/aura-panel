@@ -48,7 +48,7 @@ import {
   diagnoseForward,
   updateForwardOrder
 } from "@/api";
-import { JwtUtil } from "@/utils/jwt";
+import { getVerifiedIdentityKey, useAuthSession } from "@/utils/auth";
 
 interface Forward {
   id: number;
@@ -129,6 +129,8 @@ interface TunnelGroup {
 }
 
 export default function ForwardPage() {
+  // 身份只认已复验的会话：未复验不加载数据、不展示任何用户的转发
+  const session = useAuthSession();
   const [loading, setLoading] = useState(true);
   const [isForceDelete, setIsForceDelete] = useState(false);
   const [forwards, setForwards] = useState<Forward[]>([]);
@@ -326,8 +328,17 @@ export default function ForwardPage() {
   const [errors, setErrors] = useState<{[key: string]: string}>({});
 
   useEffect(() => {
+    if (session.state !== 'verified') {
+      // 身份未知 / 已注销：清空上一账号数据，且不发请求
+      setForwards([]);
+      setTunnels([]);
+      setForwardOrder([]);
+      setLoading(false);
+      return;
+    }
+
     loadData();
-  }, []);
+  }, [session.state, session.revision]);
 
   // 切换显示模式并保存到localStorage
   const handleViewModeChange = () => {
@@ -339,11 +350,13 @@ export default function ForwardPage() {
       // 切换到直接显示模式时，初始化拖拽排序顺序
       if (newMode === 'direct') {
         // 在平铺模式下，只对当前用户的转发进行排序
-        const currentUserId = JwtUtil.getUserIdFromToken();
-        let userForwards = forwards;
-        if (currentUserId !== null) {
-          userForwards = forwards.filter((f: Forward) => f.userId === currentUserId);
+        const currentUserId = session.userId;
+        if (currentUserId === null) {
+          // 身份未复验：不排序、不展示任何用户的转发
+          setForwardOrder([]);
+          return;
         }
+        const userForwards = forwards.filter((f: Forward) => f.userId === currentUserId);
         
         // 检查数据库中是否有排序信息
         const hasDbOrdering = userForwards.some((f: Forward) => f.inx !== undefined && f.inx !== 0);
@@ -391,12 +404,16 @@ export default function ForwardPage() {
 
   // 加载所有数据
   const loadData = async (lod = true) => {
+    // 取当前已复验身份；响应回来时若身份已变（换号/注销）一律丢弃，不落盘
+    const identityAtStart = getVerifiedIdentityKey();
     setLoading(lod);
     try {
       const [forwardsRes, tunnelsRes] = await Promise.all([
         getForwardList(),
         userTunnel()
       ]);
+
+      if (getVerifiedIdentityKey() !== identityAtStart) return;
       
       if (forwardsRes.code === 0) {
         const forwardsData = forwardsRes.data?.map((forward: any) => ({
@@ -408,11 +425,12 @@ export default function ForwardPage() {
         // 初始化拖拽排序顺序
         if (viewMode === 'direct') {
           // 在平铺模式下，只对当前用户的转发进行排序
-          const currentUserId = JwtUtil.getUserIdFromToken();
-          let userForwards = forwardsData;
-          if (currentUserId !== null) {
-            userForwards = forwardsData.filter((f: Forward) => f.userId === currentUserId);
-          }
+          const currentUserId = session.userId;
+          // 身份未复验时不初始化任何用户的排序
+          const userForwards: Forward[] =
+            currentUserId === null
+              ? []
+              : forwardsData.filter((f: Forward) => f.userId === currentUserId);
           
           // 检查数据库中是否有排序信息
           const hasDbOrdering = userForwards.some((f: Forward) => f.inx !== undefined && f.inx !== 0);
@@ -1346,10 +1364,11 @@ export default function ForwardPage() {
     // 在平铺模式下，只显示当前用户的转发
     let filteredForwards = forwards;
     if (viewMode === 'direct') {
-      const currentUserId = JwtUtil.getUserIdFromToken();
-      if (currentUserId !== null) {
-        filteredForwards = forwards.filter(forward => forward.userId === currentUserId);
-      }
+      const currentUserId = session.userId;
+      // 身份未复验时不展示任何用户的转发
+      filteredForwards = currentUserId === null
+        ? []
+        : forwards.filter(forward => forward.userId === currentUserId);
     }
     
     // 确保过滤后的转发列表有效
@@ -1581,6 +1600,15 @@ export default function ForwardPage() {
       </Card>
     );
   };
+
+  // 身份未复验（首次加载 / 失效中 / 已注销）时不渲染任何转发数据
+  if (session.state !== 'verified') {
+    return (
+      <div className="flex items-center justify-center h-64 text-default-600">
+        正在确认登录状态...
+      </div>
+    );
+  }
 
   if (loading) {
     return (

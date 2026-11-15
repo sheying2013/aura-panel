@@ -18,7 +18,8 @@ public interface UserService extends IService<User> {
     R login(LoginDto loginDto);
 
     /**
-     * 退出登录：token 版本号自增，当前 token 立即失效（round51）。
+     * 退出登录：仅吊销当前票据；新票据使用 sid，旧票据使用摘要。
+     * 不自增用户级 token_version，避免旧请求迟到时影响新会话。
      */
     R logout();
 

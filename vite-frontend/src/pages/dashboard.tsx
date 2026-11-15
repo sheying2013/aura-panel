@@ -5,6 +5,7 @@ import toast from 'react-hot-toast';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
 import Network from '@/api/network';
+import { getVerifiedIdentityKey, isVerifiedAdmin, useAuthSession } from '@/utils/auth';
 
 import {
   NODE_STATUS_ORDER,
@@ -95,7 +96,7 @@ export const NodeHealthCapacityNotice = ({ nodes }: { nodes: readonly NodeHealth
 };
 
 // ========== 身份快照：登录/退出可能发生在别的标签页 ==========
-// 只做身份核对，不猜服务端状态：浏览器侧能观察到的只有 localStorage 里的 token / admin / role_id。
+// 会话代次只用于浏览器侧隔离，不是服务端鉴权或跨版本一致性证明。
 
 /** 浏览器侧能看到的身份三件套 */
 export interface IdentitySnapshot {
@@ -103,22 +104,24 @@ export interface IdentitySnapshot {
   /** 登录时服务端写入的兼容标记；老会话可能没有这个字段 */
   admin: string | null;
   roleId: string | null;
+  generation?: string | null;
 }
 
 /** 身份指纹：token 与 admin/role_id 任一变化都算换了账号 */
 export const identityKeyOf = (identity: IdentitySnapshot): string =>
-  JSON.stringify([identity.token, identity.admin, identity.roleId]);
+  JSON.stringify([identity.token, identity.admin, identity.roleId, identity.generation ?? null]);
 
 /** 读出当前身份；写入方与登录页、管理端布局保持一致 */
 export const readIdentitySnapshot = (storage: Pick<Storage, 'getItem'>): IdentitySnapshot => ({
   token: storage.getItem('token'),
   admin: storage.getItem('admin'),
   roleId: storage.getItem('role_id'),
+  generation: storage.getItem('aura_auth_generation'),
 });
 
 /** 管理员必须有 token；任一角色标记明确非管理员或两者冲突时保守拒绝。 */
 export const isAdminIdentity = (identity: IdentitySnapshot): boolean => {
-  if (!identity.token?.trim()) return false;
+  if (!identity.token?.trim() || identity.generation?.startsWith('pending:')) return false;
   if (identity.admin !== null && identity.admin !== 'true') return false;
   if (identity.roleId !== null && identity.roleId !== '0') return false;
   return identity.admin === 'true' || identity.roleId === '0';
@@ -126,7 +129,7 @@ export const isAdminIdentity = (identity: IdentitySnapshot): boolean => {
 
 /** storage 事件里只有这三个键会改变身份（key 为 null 表示整体被 clear） */
 export const isIdentityStorageKey = (key: string | null): boolean =>
-  key === null || key === 'token' || key === 'admin' || key === 'role_id';
+  key === null || key === 'token' || key === 'admin' || key === 'role_id' || key === 'aura_auth_generation';
 
 export interface IdentityWatchOptions {
   read: () => IdentitySnapshot;
@@ -142,8 +145,7 @@ export interface IdentityWatchOptions {
  *
  * <p>跨标签页：storage 事件（别的标签页登录/退出只改 localStorage，不会重挂载本页）。
  * <p>页内恢复：从 bfcache 返回时 storage 补不到，pageshow / visibilitychange 时再主动核对一次。
- * <p>同标签页的登录/退出本身就会让路由重挂载本页，不需要额外事件；同 token 重新登录
- * （服务端换了账号但 token 没变）浏览器侧没有任何信号，这里检测不到，只能靠请求失败兜底。
+ * <p>同标签页登录通过 aura-auth-change 通知；跨标签页通过代次存储事件区分同 token 登录。
  *
  * <p>返回退订函数，卸载时必须调用。
  */
@@ -176,6 +178,7 @@ export const watchIdentity = (options: IdentityWatchOptions): (() => void) => {
 
   win.addEventListener('storage', onStorage);
   win.addEventListener('pageshow', sync);
+  win.addEventListener('aura-auth-change', sync);
   doc.addEventListener('visibilitychange', onVisibility);
   // 补上 render 与监听安装之间发生的身份变更。
   sync();
@@ -183,6 +186,7 @@ export const watchIdentity = (options: IdentityWatchOptions): (() => void) => {
   return () => {
     win.removeEventListener('storage', onStorage);
     win.removeEventListener('pageshow', sync);
+    win.removeEventListener('aura-auth-change', sync);
     doc.removeEventListener('visibilitychange', onVisibility);
   };
 };
@@ -237,10 +241,10 @@ export default function DashboardPage() {
   const packageRequestSeqRef = useRef(0);
   // 手工刷新代次：被取代的刷新不再提示、不再改 refreshing
   const refreshSeqRef = useRef(0);
-  // 身份指纹：另一标签页登录/退出只改 localStorage，这里一变就整段重装
-  const [identityKey, setIdentityKey] = useState(() => identityKeyOf(readIdentitySnapshot(localStorage)));
-  // 即使同一批次先后切换回原身份，也要重建已停止的请求作用域。
-  const [identityScopeRevision, setIdentityScopeRevision] = useState(0);
+  // 身份只认已复验的会话（IDB 已提交代次 + 本地完整身份一致）；复验中是 'unknown'，已注销是 'anonymous'
+  const session = useAuthSession();
+  // 身份指纹：会话一变就整段重装，且 A→B→A 也会因 revision 变化而重建作用域。
+  const identityKey = session.state === 'verified' ? session.identityKey : session.state;
 
   // 检查有效期通知
   const checkExpirationNotifications = (info: UserInfo, tunnels: UserTunnel[]) => {
@@ -275,12 +279,9 @@ export default function DashboardPage() {
     }
   };
 
-  // 身份一变（另一标签页登录/退出、bfcache 或可见性恢复）就换 key，这一段整体重跑：
-  // 停表作废旧请求 → 清掉上一账号数据 → 按当前身份重新装载。
+  // 身份一变（复验结果、另一标签页登录/退出、bfcache 或可见性恢复）就换 key，这一段整体重跑：
+  // 停表作废旧请求 → 清掉上一账号数据 → 按已复验身份重新装载。
   useEffect(() => {
-    const identity = readIdentitySnapshot(localStorage);
-    // 身份在 render 和 effect 之间变化时，等待 watcher 切换 key，绝不使用旧作用域发请求。
-    if (identityKeyOf(identity) !== identityKey) return;
     const controller = new AbortController();
     packageAbortRef.current = controller;
     let poller: NodeHealthPoller | null = null;
@@ -310,7 +311,8 @@ export default function DashboardPage() {
     setAddressModalOpen(false);
     setAddressModalTitle('');
     setAddressList([]);
-    if (!identity.token?.trim()) {
+    if (session.state !== 'verified') {
+      // 身份未知 / 已注销：不发请求，也不展示上一账号的数据
       setLoading(false);
       return stopIdentityScope;
     }
@@ -318,7 +320,7 @@ export default function DashboardPage() {
     void loadPackageData();
     localStorage.setItem('e', '/dashboard');
 
-    if (!isAdminIdentity(identity)) {
+    if (!session.admin) {
       // 非管理员不读管理员摘要：上面已清空，这里只留拒绝态
       setNodeHealthSnapshot(denyNodeHealthSnapshot);
       return stopIdentityScope;
@@ -330,43 +332,13 @@ export default function DashboardPage() {
     poller.start();
     // 卸载时停表并作废在途结果，避免卸载后仍把旧在线写回界面
     return stopIdentityScope;
-  }, [identityKey, identityScopeRevision]);
-
-  // 另一标签页登录/退出不会重挂载本页：靠 storage 感知，bfcache/可见性恢复时再核对一次
-  useEffect(() => {
-    return watchIdentity({
-      initialKey: identityKey,
-      read: () => readIdentitySnapshot(localStorage),
-      onChange: (nextKey) => {
-        // 在 React 重新提交新身份前同步终止旧作用域，并作废全部异步回写。
-        packageRequestSeqRef.current += 1;
-        refreshSeqRef.current += 1;
-        packageAbortRef.current?.abort();
-        packageAbortRef.current = null;
-        nodeHealthPollerRef.current?.stop();
-        nodeHealthPollerRef.current = null;
-        setUserInfo({} as UserInfo);
-        setUserTunnels([]);
-        setForwardList([]);
-        setStatisticsFlows([]);
-        setAddressModalOpen(false);
-        setAddressModalTitle('');
-        setAddressList([]);
-        setNodeHealthSnapshot(clearNodeHealthSnapshot);
-        setRefreshing(false);
-        setLoading(true);
-        setIdentityKey(nextKey);
-        setIdentityScopeRevision((revision) => revision + 1);
-      },
-    });
-  }, [identityKey]);
+  }, [identityKey, session.state, session.admin, session.revision]);
 
   // 可取消的只读 POST：旧 Network.post 遇 401 不会 settle，且会用旧 token 误清当前会话
   const loadPackageData = async (): Promise<boolean> => {
     const controller = packageAbortRef.current;
-    // 页面已卸载 / 尚未挂载：不发请求，也不写任何状态
-    const identity = readIdentitySnapshot(localStorage);
-    if (!controller || controller.signal.aborted || !identity.token?.trim() || identityKeyOf(identity) !== identityKey) return false;
+    // 页面已卸载 / 尚未挂载 / 身份已失效：不发请求，也不写任何状态
+    if (!controller || controller.signal.aborted || getVerifiedIdentityKey() !== identityKey) return false;
 
     const requestSeq = ++packageRequestSeqRef.current;
     // 仍是最新一次请求且页面未卸载时才允许回写；旧响应一律丢弃
@@ -374,7 +346,7 @@ export default function DashboardPage() {
       packageAbortRef.current === controller &&
       packageRequestSeqRef.current === requestSeq &&
       !controller.signal.aborted &&
-      identityKeyOf(readIdentitySnapshot(localStorage)) === identityKey;
+      getVerifiedIdentityKey() === identityKey;
 
     try {
       const res = await Network.postCancellable<any>('/user/package', {}, { signal: controller.signal });
@@ -409,8 +381,7 @@ export default function DashboardPage() {
     const created = createNodeHealthPoller({
       // 可取消的只读 POST：卸载/超时时中断请求；401/403 返回明确结果
       read: async (signal) => {
-        const identity = readIdentitySnapshot(localStorage);
-        if (identityKeyOf(identity) !== identityKey || !isAdminIdentity(identity)) {
+        if (getVerifiedIdentityKey() !== identityKey || !isVerifiedAdmin()) {
           return { ok: false, denied: true, message: '当前身份不可读取节点健康摘要' };
         }
         return interpretNodeHealthResponse(
@@ -418,8 +389,10 @@ export default function DashboardPage() {
         );
       },
       onChange: (snapshot) => {
-        if (identityKeyOf(readIdentitySnapshot(localStorage)) === identityKey) setNodeHealthSnapshot(snapshot);
+        if (getVerifiedIdentityKey() === identityKey) setNodeHealthSnapshot(snapshot);
       },
+      // 缓存隔离键只认已复验身份，避免用未提交/已注销的残留 token 当作用域
+      identityKey: getVerifiedIdentityKey,
       // 切回标签页/窗口重新聚焦时立刻重新验证，别让被压低的定时器把旧结论留在页面上
       subscribeWake: subscribeNodeHealthWake,
     });
@@ -430,9 +403,8 @@ export default function DashboardPage() {
 
   // 读取失败/被拒时轮询器会把摘要清空，这里不会留下上一次的在线结论
   const loadNodeHealth = (options?: { showLoading?: boolean }): Promise<boolean> => {
-    // 按调用时的身份判定，不信任渲染时的旧快照
-    const identity = readIdentitySnapshot(localStorage);
-    if (identityKeyOf(identity) !== identityKey || !isAdminIdentity(identity)) {
+    // 按调用时的已复验身份判定，不信任渲染时的旧快照
+    if (getVerifiedIdentityKey() !== identityKey || !isVerifiedAdmin()) {
       setNodeHealthSnapshot(denyNodeHealthSnapshot);
       return Promise.resolve(true); // 普通用户无需请求管理员接口
     }
@@ -786,8 +758,8 @@ export default function DashboardPage() {
   const healthUnknown = healthCounts.unknown;
   const healthStale = healthCounts.staleCount;
 
-  const renderIdentity = readIdentitySnapshot(localStorage);
-  if (!renderIdentity.token?.trim() || identityKeyOf(renderIdentity) !== identityKey) {
+  // 身份未知或已注销时不渲染任何账号数据
+  if (session.state !== 'verified' || identityKey !== session.identityKey) {
     return <div className="px-3 lg:px-6 pt-4 text-[#888]">请登录后查看仪表板</div>;
   }
 

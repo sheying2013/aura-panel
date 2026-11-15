@@ -3,6 +3,7 @@ package com.admin.common.interceptor;
 
 import com.admin.common.exception.UnauthorizedException;
 import com.admin.common.utils.JwtUtil;
+import com.admin.common.utils.TokenRevocationStore;
 import com.admin.entity.User;
 import com.admin.mapper.UserMapper;
 import org.springframework.stereotype.Component;
@@ -22,6 +23,9 @@ public class JwtInterceptor implements HandlerInterceptor {
 
     @Resource
     private UserMapper userMapper;
+
+    @Resource
+    private TokenRevocationStore tokenRevocations;
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
@@ -48,6 +52,13 @@ public class JwtInterceptor implements HandlerInterceptor {
         }
         int dbVersion = user.getTokenVersion() == null ? 0 : user.getTokenVersion();
         if (JwtUtil.getTokenVersion(token) != dbVersion) {
+            throw new UnauthorizedException("登录状态已失效，请重新登录");
+        }
+
+        // 只吊销当前票据：新票据沿用 sid，旧票据按已验签原文计算摘要键。
+        // 吊销存储不可用时传播 503，不能误判未吊销。
+        String revocationKey = JwtUtil.getRevocationKey(token);
+        if (tokenRevocations.isRevoked(revocationKey)) {
             throw new UnauthorizedException("登录状态已失效，请重新登录");
         }
 

@@ -6,6 +6,7 @@ import { useNavigate } from "react-router-dom";
 import { loginValidationErrors } from "./loginValidation";
 import toast from 'react-hot-toast';
 import axios from 'axios';
+import { readAuthSnapshot, saveLoginSession, SessionLockUnavailableError, LoginSessionChangedError } from '@/api/network';
 import { isWebViewFunc } from '@/utils/panel';
 import { siteConfig } from '@/config/site';
 import DefaultLayout from "@/layouts/default";
@@ -162,6 +163,7 @@ export default function IndexPage() {
         captchaId: form.captchaId,
       };
 
+      const loginStart = readAuthSnapshot();
       const response = await login(loginData);
       
       if (response.code !== 0) {
@@ -169,22 +171,14 @@ export default function IndexPage() {
         return;
       }
 
+      // 两个成功分支都先提交同一份带代次的会话。
+      await saveLoginSession(response.data, loginStart);
       // 检查是否需要强制修改密码
       if (response.data.requirePasswordChange) {
-        localStorage.setItem('token', response.data.token);
-        localStorage.setItem("role_id", response.data.role_id.toString());
-        localStorage.setItem("name", response.data.name);
-        localStorage.setItem("admin", (response.data.role_id === 0).toString());
         toast.success('检测到默认密码，即将跳转到修改密码页面');
         navigate("/change-password");
         return;
       }
-
-      // 保存登录信息
-      localStorage.setItem('token', response.data.token);
-      localStorage.setItem("role_id", response.data.role_id.toString());
-      localStorage.setItem("name", response.data.name);
-      localStorage.setItem("admin", (response.data.role_id === 0).toString());
 
       // 登录成功
       toast.success('登录成功');
@@ -192,7 +186,7 @@ export default function IndexPage() {
 
     } catch (error) {
       console.error('登录错误:', error);
-      toast.error("网络错误，请稍后重试");
+      toast.error(error instanceof SessionLockUnavailableError ? error.message : error instanceof LoginSessionChangedError ? error.message : "网络错误，请稍后重试");
     } finally {
       setLoading(false);
     }

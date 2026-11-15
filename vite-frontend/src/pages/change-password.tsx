@@ -1,7 +1,7 @@
 import { Button } from "@heroui/button";
 import { Input } from "@heroui/input";
 import { Card, CardBody, CardHeader } from "@heroui/card";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import toast from 'react-hot-toast';
 
@@ -9,6 +9,7 @@ import { title } from "@/components/primitives";
 import { updatePassword } from "@/api";
 import DefaultLayout from "@/layouts/default";
 import { safeLogout } from "@/utils/logout";
+import { readAuthSnapshot } from "@/api/network";
 
 interface PasswordForm {
   newUsername: string;
@@ -25,6 +26,8 @@ export default function ChangePasswordPage() {
     confirmPassword: ''
   });
   const [loading, setLoading] = useState(false);
+  const [exitPending, setExitPending] = useState(false);
+  const exitIdentity = useRef<ReturnType<typeof readAuthSnapshot> | null>(null);
   const [errors, setErrors] = useState<Partial<PasswordForm>>({});
   const navigate = useNavigate();
 
@@ -73,18 +76,16 @@ export default function ChangePasswordPage() {
 
     setLoading(true);
     try {
+      const started = readAuthSnapshot();
       const response = await updatePassword(form);
       
       if (response.code === 0) {
         toast.success(response.msg || '账号密码修改成功');
         
-        // 使用 toast 确认对话框的替代方案
-        setTimeout(() => {
-          toast.success('即将跳转到登陆页面，请重新登录');
-          setTimeout(() => {
-            logout();
-          }, 1000);
-        }, 1000);
+        // 立即执行条件退出，避免延时任务误清另一个标签的新登录。
+        exitIdentity.current = started;
+        setExitPending(true);
+        await logout(started);
       } else {
         toast.error(response.msg || '账号密码修改失败');
       }
@@ -96,13 +97,20 @@ export default function ChangePasswordPage() {
     }
   };
 
-  const logout = () => {
-    safeLogout();
+  const logout = async (expected: ReturnType<typeof readAuthSnapshot>) => {
+    const result = await safeLogout(expected);
+    if (result === 'failed') {
+      toast.error('密码已修改，但原会话退出未确认或身份已变化；当前会话已保留。');
+      return;
+    }
+    toast(result === 'local-only'
+      ? '已尽力清理本地会话；跨标签状态及服务端撤销均未确认。'
+      : '本地会话已清除；服务端注销结果未确认。', { icon: '⚠️', duration: 8000 });
     navigate('/');
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !loading) {
+    if (e.key === 'Enter' && !loading && !exitPending) {
       handleSubmit();
     }
   };
@@ -176,16 +184,28 @@ export default function ChangePasswordPage() {
                   errorMessage={errors.confirmPassword}
                 />
                 
-                <Button
-                  color="warning"
-                  size="lg"
-                  onClick={handleSubmit}
-                  isLoading={loading}
-                  disabled={loading}
-                  className="mt-2"
-                >
-                  {loading ? "修改中..." : "立即修改账号密码"}
-                </Button>
+                {exitPending ? (
+                  <Button color="warning" size="lg" isDisabled={loading} className="mt-2"
+                    onPress={async () => {
+                      setLoading(true);
+                      try {
+                        if (exitIdentity.current) await logout(exitIdentity.current);
+                      } finally { setLoading(false); }
+                    }}>
+                    {loading ? "退出处理中..." : "重试退出并重新登录"}
+                  </Button>
+                ) : (
+                  <Button
+                    color="warning"
+                    size="lg"
+                    onClick={handleSubmit}
+                    isLoading={loading}
+                    disabled={loading}
+                    className="mt-2"
+                  >
+                    {loading ? "修改中..." : "立即修改账号密码"}
+                  </Button>
+                )}
                 
                 <div className="bg-warning-50 border border-warning-200 text-warning-700 px-3 py-2 rounded-lg text-sm text-center">
                   ⚠️ 注意：修改账号密码后需要重新登录

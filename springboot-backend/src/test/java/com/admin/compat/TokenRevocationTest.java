@@ -3,10 +3,20 @@ package com.admin.compat;
 import com.admin.common.dto.ChangePasswordDto;
 import com.admin.common.dto.UserUpdateDto;
 import com.admin.common.exception.UnauthorizedException;
+import com.admin.common.exception.GlobalExceptionHandler;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import org.springframework.dao.DataAccessResourceFailureException;
 import com.admin.common.interceptor.JwtInterceptor;
 import com.admin.common.lang.R;
 import com.admin.common.utils.JwtUtil;
 import com.admin.common.utils.Md5Util;
+import com.admin.common.utils.TokenRevocationStore;
 import com.admin.config.WebMvcConfig;
 import com.admin.entity.User;
 import com.admin.mapper.UserMapper;
@@ -20,11 +30,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.context.annotation.Bean;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 
 import javax.annotation.Resource;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import javax.servlet.http.HttpServletRequest;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -42,6 +55,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -59,8 +73,9 @@ import static org.mockito.Mockito.when;
  * <p>这里锁住的行为：① 新签发的 token 带 ver，且能原样读回；② round51 之前签发的 token 没有 ver，
  * 必须读成 0（升级瞬间不能把已登录用户全踢下线）；③ ver 非法/坏 token 一律读成 0，不抛异常；
  * ④ 拦截器回库比对账号状态与版本号，停用、删号、版本不符、无 token、坏 token 全部拒绝且文案可辨；
- * ⑤ 登出用一条 setSql 自增，改密（用户自己的与管理员代改）把版本号写进与密码同一条 updateById，
- * 不出现「密码已换、旧 token 仍可用」的中间态；⑥ WebMvcConfig 不再 new 拦截器，避免两个实例。
+ * ⑤ 改密（用户自己的与管理员代改）把版本号写进与密码同一条 updateById，不出现「密码已换、旧 token
+ * 仍可用」的中间态；⑥ round63 起登出只吊销本次登录的 sid（不再自增用户级版本号，跨标签迟到登出不误杀
+ * 新登录），老 token 没有 sid 时按其摘要吊销；⑦ WebMvcConfig 不再 new 拦截器，避免两个实例。
  */
 class TokenRevocationTest {
 
@@ -69,7 +84,9 @@ class TokenRevocationTest {
 
     private final UserMapper userMapper = mock(UserMapper.class);
     private final ForwardService forwardService = mock(ForwardService.class);
+    private final JdbcTemplate jdbcTemplate = mock(JdbcTemplate.class);
     private UserServiceImpl userService;
+    private TokenRevocationStore tokenRevocations;
     private JwtInterceptor interceptor;
 
     @BeforeEach
@@ -78,10 +95,18 @@ class TokenRevocationTest {
         // 单测没有容器，只能反射塞进去，否则 calculateSignature 里 SECRET_KEY.getBytes() 直接 NPE。
         ReflectionTestUtils.setField(JwtUtil.class, "SECRET_KEY", TEST_SECRET);
 
+        // round63：登出改成按 sid 吊销（revoked_token 表），单测用 mock 的 JdbcTemplate 顶替库表
+        tokenRevocations = new TokenRevocationStore();
+        ReflectionTestUtils.setField(tokenRevocations, "jdbcTemplate", jdbcTemplate);
+        when(jdbcTemplate.update(anyString(), any(Object.class), any(Object.class))).thenReturn(1);
+        when(jdbcTemplate.queryForObject(anyString(), any(Class.class), any(Object.class), any(Object.class)))
+                .thenReturn(0);
+
         userService = new UserServiceImpl();
         ReflectionTestUtils.setField(userService, "baseMapper", userMapper);
         ReflectionTestUtils.setField(userService, "userMapper", userMapper);
         ReflectionTestUtils.setField(userService, "forwardService", forwardService);
+        ReflectionTestUtils.setField(userService, "tokenRevocations", tokenRevocations);
         when(userMapper.selectCount(any())).thenReturn(0);
         when(userMapper.updateById(any())).thenReturn(1);
         when(userMapper.update(any(), any())).thenReturn(1);
@@ -90,6 +115,7 @@ class TokenRevocationTest {
 
         interceptor = new JwtInterceptor();
         ReflectionTestUtils.setField(interceptor, "userMapper", userMapper);
+        ReflectionTestUtils.setField(interceptor, "tokenRevocations", tokenRevocations);
     }
 
     @AfterEach
@@ -206,26 +232,93 @@ class TokenRevocationTest {
         verify(userMapper, never()).selectById(anyLong());
     }
 
+    @Test
+    void revocationLookupFailureStopsValidSessionAndMapsTo503() throws Exception {
+        User stored = user(USER_ID, 1, 4);
+        when(userMapper.selectById(USER_ID)).thenReturn(stored);
+        String token = JwtUtil.generateToken(stored);
+        when(jdbcTemplate.queryForObject(anyString(), any(Class.class), any(Object.class), any(Object.class)))
+                .thenThrow(new DataAccessResourceFailureException("unavailable"))
+                .thenReturn(null)
+                .thenReturn(0);
+        assertThrows(TokenRevocationStore.RevocationStoreUnavailableException.class,
+                () -> interceptor.preHandle(requestWith(token), mock(javax.servlet.http.HttpServletResponse.class), new Object()));
+        assertThrows(TokenRevocationStore.RevocationStoreUnavailableException.class,
+                () -> interceptor.preHandle(requestWith(token), mock(javax.servlet.http.HttpServletResponse.class), new Object()));
+        assertTrue(interceptor.preHandle(requestWith(token), mock(javax.servlet.http.HttpServletResponse.class), new Object()));
+        Method handler = GlobalExceptionHandler.class.getMethod("handleRevocationStoreUnavailable", TokenRevocationStore.RevocationStoreUnavailableException.class);
+        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, handler.getAnnotation(ResponseStatus.class).value());
+        assertEquals(503, new GlobalExceptionHandler().handleRevocationStoreUnavailable(new TokenRevocationStore.RevocationStoreUnavailableException()).getCode());
+    }
+
+    @RestController
+    static class RevocationProbeController {
+        @GetMapping("/revocation-probe")
+        public String probe() { return "ok"; }
+    }
+
+    @Test
+    void interceptorFailureReallyReturnsHttp503() throws Exception {
+        User stored = user(USER_ID, 1, 4);
+        when(userMapper.selectById(USER_ID)).thenReturn(stored);
+        when(jdbcTemplate.queryForObject(anyString(), any(Class.class), any(Object.class), any(Object.class)))
+                .thenThrow(new DataAccessResourceFailureException("unavailable"));
+        MockMvcBuilders.standaloneSetup(new RevocationProbeController())
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .addInterceptors(interceptor).build()
+                .perform(get("/revocation-probe").header("Authorization", JwtUtil.generateToken(stored)))
+                .andExpect(status().isServiceUnavailable());
+    }
+
     // ---------------------------------------------------------------- 登出
 
     @Test
-    @SuppressWarnings("unchecked")
-    void logoutBumpsVersionInSingleSqlUpdate() {
+    void logoutRevokesOnlyPresentedSession() {
         User user = user(USER_ID, 1, 4);
-        givenRequestToken(JwtUtil.generateToken(user));
+        String token = JwtUtil.generateToken(user);
+        givenRequestToken(token);
 
         R result = userService.logout();
 
         assertEquals(0, result.getCode(), "登出应返回成功，实际：" + result.getMsg());
-        ArgumentCaptor<Wrapper<User>> captor = ArgumentCaptor.forClass(Wrapper.class);
-        verify(userMapper, times(1)).update(isNull(), captor.capture());
-        String sqlSet = ((UpdateWrapper<User>) captor.getValue()).getSqlSet();
-        assertNotNull(sqlSet, "登出必须用 setSql 自增，不能先读再写");
-        String normalized = sqlSet.toLowerCase().replaceAll("\\s+", " ");
-        assertTrue(normalized.contains("token_version"), "自增语句必须落在 token_version 上，实际：" + sqlSet);
-        assertTrue(normalized.contains("+ 1"), "必须是自增，实际：" + sqlSet);
-        assertTrue(normalized.contains("coalesce(token_version,0)") || normalized.contains("coalesce(token_version, 0)"),
-                "库里历史 NULL 行必须按 0 起算，实际：" + sqlSet);
+        // round63：吊销的是请求头里这条 token 的 sid，TTL 用 token 自己的 exp（过期后由清理逻辑删行）
+        ArgumentCaptor<Object> sessionId = ArgumentCaptor.forClass(Object.class);
+        ArgumentCaptor<Object> expiresAt = ArgumentCaptor.forClass(Object.class);
+        verify(jdbcTemplate, times(1)).update(anyString(), sessionId.capture(), expiresAt.capture());
+        assertEquals(JwtUtil.getSessionId(token), String.valueOf(sessionId.getValue()),
+                "吊销记录必须落在这一次登录的 sid 上，实际：" + sessionId.getValue());
+        assertEquals(JwtUtil.getExpireAtMillis(token), ((Number) expiresAt.getValue()).longValue(),
+                "吊销记录的 TTL 必须取 token 自己的 exp");
+        verify(userMapper, never()).update(any(), any());
+        assertEquals(4, user.getTokenVersion(), "登出不能再动用户级版本号，否则会连带踢掉别的会话");
+    }
+
+    @Test
+    void logoutOfLegacyTokenWithoutSidRevokesItsDigest() throws Exception {
+        // 旧 token 没有 sid：只吊销签名验证后的该份票据。
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("sub", String.valueOf(USER_ID));
+        payload.put("iat", System.currentTimeMillis() / 1000);
+        payload.put("exp", System.currentTimeMillis() / 1000 + 3600);
+        payload.put("user", "legacy");
+        payload.put("name", "legacy");
+        payload.put("role_id", 1);
+        payload.put("ver", 4);
+        String legacyToken = signedToken(payload);
+        assertNull(JwtUtil.getSessionId(legacyToken), "老 token 没有 sid");
+        assertTrue(JwtUtil.validateToken(legacyToken));
+        givenRequestToken(legacyToken);
+
+        R result = userService.logout();
+
+        assertEquals(0, result.getCode(), "老 token 登出仍必须成功，实际：" + result.getMsg());
+        ArgumentCaptor<Object> key = ArgumentCaptor.forClass(Object.class);
+        ArgumentCaptor<Object> expires = ArgumentCaptor.forClass(Object.class);
+        verify(jdbcTemplate).update(anyString(), key.capture(), expires.capture());
+        assertEquals(JwtUtil.getRevocationKey(legacyToken), key.getValue());
+        assertTrue(String.valueOf(key.getValue()).startsWith("L"));
+        assertEquals(JwtUtil.getExpireAtMillis(legacyToken), ((Number) expires.getValue()).longValue());
+        verify(userMapper, never()).update(any(), any());
     }
 
     // ---------------------------------------------------------------- 改密
@@ -388,6 +481,15 @@ class TokenRevocationTest {
 
     private static void givenRequestToken(String token) {
         RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(requestWith(token)));
+    }
+
+    private static String signedToken(Map<String, Object> payload) throws Exception {
+        String unsigned = fakeToken(payload);
+        String prefix = unsigned.substring(0, unsigned.lastIndexOf('.'));
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(TEST_SECRET.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        return prefix + "." + Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(mac.doFinal(prefix.getBytes(StandardCharsets.UTF_8)));
     }
 
     /** 手工拼一个 payload 可控的 token：getTokenVersion 只读 payload，不过签名。 */

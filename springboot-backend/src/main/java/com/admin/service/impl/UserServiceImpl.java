@@ -13,6 +13,7 @@ import com.admin.common.utils.JwtUtil;
 import com.admin.common.utils.Md5Util;
 import com.admin.common.utils.QuotaResume;
 import com.admin.common.utils.ResourceLifecycleLocks;
+import com.admin.common.utils.TokenRevocationStore;
 import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
@@ -49,6 +50,9 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     @Resource
     @Lazy
     ForwardService forwardService;
+
+    @Resource
+    TokenRevocationStore tokenRevocations;
 
     @Resource
     UserMapper userMapper;
@@ -143,6 +147,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
 
     @Override
     public R logout() {
+        String token = JwtUtil.getTokenFromRequest();
         Integer userId;
         try {
             userId = JwtUtil.getUserIdFromToken();
@@ -152,19 +157,17 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             return R.err("未登录或token已过期");
         }
         if (userId == null) {
-            // 不能对 eq("id", null) 静默返回成功，否则前后端都以为已经吊销，实际一行没动。
+            // 不能对缺失的 sub 静默返回成功，否则前后端都以为已经吊销，实际一行没动。
             return R.err("未登录或token已过期");
         }
-        try {
-            // 只自增，不做「先读再写」：并发登出/改密时读改写会互相覆盖，版本号就不再单调。
-            boolean updated = this.update(new UpdateWrapper<User>()
-                    .eq("id", userId)
-                    .setSql("token_version = COALESCE(token_version,0) + 1"));
-            if (!updated) return R.err("退出登录失败：账号不存在");
-            return R.ok();
-        } catch (Exception e) {
-            return R.err("退出登录失败：" + innermostMessage(e));
-        }
+
+        // 只对已验签、未过期的当前票据生成吊销键；旧票据使用摘要，不再自增用户版本。
+        if (!JwtUtil.validateToken(token)) return R.err("未登录或token已过期");
+        long expiresAt = JwtUtil.getExpireAtMillis(token);
+        if (expiresAt <= System.currentTimeMillis()) return R.err("未登录或token已过期");
+        String key = JwtUtil.getRevocationKey(token);
+        if (!tokenRevocations.revoke(key, expiresAt)) return R.err("退出登录失败，请稍后重试");
+        return R.ok();
     }
 
     @Override

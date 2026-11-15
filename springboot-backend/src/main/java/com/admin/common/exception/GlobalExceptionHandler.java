@@ -1,6 +1,9 @@
 package com.admin.common.exception;
 
 import com.admin.common.lang.R;
+import com.admin.common.utils.TokenRevocationStore.RevocationStoreUnavailableException;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.catalina.connector.ClientAbortException;
 import org.springframework.validation.BindingResult;
@@ -30,6 +33,12 @@ public class GlobalExceptionHandler {
     public R handleUnauthorizedException(UnauthorizedException e) {
         log.info("未授权异常：----------------{}", e.getMessage());
         return R.err(401, e.getMessage());
+    }
+
+    @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
+    @ExceptionHandler(value = RevocationStoreUnavailableException.class)
+    public R handleRevocationStoreUnavailable(RevocationStoreUnavailableException e) {
+        return R.err(503, "会话状态暂时不可用，请稍后重试");
     }
 
     @ExceptionHandler(value = Exception.class)

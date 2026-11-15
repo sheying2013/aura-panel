@@ -2,14 +2,13 @@
  * 组件级用例：仪表板在「另一个标签页换了账号」时的状态隔离。
  *
  * 锁死四件事：
- * 1. 身份指纹覆盖 token 与 admin/role_id：任一变化都算换账号，三项都没变就不算；
- * 2. 只有 storage 里的 token/admin/role_id（或整库 clear）才触发核对，主题/路由记忆等键不误触发；
+ * 1. 身份指纹覆盖 token、admin/role_id 与可选代次；
+ * 2. 认证相关 storage 键（或整库 clear）触发核对，主题/路由记忆等键不误触发；
  * 3. 从 bfcache 返回、标签页回到前台时也能补上核对（这两条路径没有 storage 事件），隐藏期间不动；
  * 4. 清空语义：旧账号的摘要（含管理员在线结论）必须落回 idle/denied 且 summary 为 null；
  *    退订后三个监听器全部摘掉，StrictMode 反复挂载/卸载不会留下监听器。
  *
- * 局限（如实记录）：同 token 重新登录时 token 与 admin/role_id 都不变，浏览器侧没有任何信号，
- * 这里检测不到，只能靠后续请求的 401/403 兜底 —— 用例不假装覆盖这种情况。
+ * 局限：旧版客户端不会写会话代次，同 token 同角色重登仍没有可观测的变化。
  *
  * 运行：node --import ./tests/register.mjs --test ./tests/dashboard-identity-isolation.test.tsx
  */
@@ -254,6 +253,25 @@ test("身份指纹把 token 与 admin/role_id 一起算：任一变化都算换�
   assert.notEqual(identityKeyOf(base), identityKeyOf(identity("token-a", "true", "0")));
   assert.notEqual(identityKeyOf(base), identityKeyOf(identity("token-a", "false", "0")));
   assert.notEqual(identityKeyOf(base), identityKeyOf(identity(null, null, null)));
+});
+
+test("同 token 同角色新代次触发同页和跨页失效，写入中禁止管理员读取", () => {
+  seedStorage(identity("same", "true", "0"));
+  localStorageStub.setItem("aura_auth_generation", "ready:old");
+  const world = createEventWorld();
+  const seen: string[] = [];
+  const dispose = subscribe(world, next => seen.push(next));
+  localStorageStub.setItem("aura_auth_generation", "pending:new");
+  world.win.fire("aura-auth-change");
+  assert.equal(seen.length, 1);
+  assert.equal(isAdminIdentity(readIdentitySnapshot(localStorageStub)), false);
+  localStorageStub.setItem("aura_auth_generation", "ready:new");
+  world.win.fire("storage", { key: "aura_auth_generation" });
+  assert.equal(seen.length, 2);
+  assert.equal(isAdminIdentity(readIdentitySnapshot(localStorageStub)), true);
+  assert.equal(isIdentityStorageKey("aura_auth_generation"), true);
+  dispose();
+  assert.equal(world.win.count("aura-auth-change"), 0);
 });
 
 test("管理员判定需要 token 且标记冲突时保守拒绝", () => {

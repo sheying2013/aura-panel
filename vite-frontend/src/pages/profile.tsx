@@ -9,6 +9,7 @@ import { isWebViewFunc } from '@/utils/panel';
 import { siteConfig } from '@/config/site';
 import { updatePassword } from '@/api';
 import { safeLogout } from '@/utils/logout';
+import { readAuthSnapshot } from '@/api/network';
 interface PasswordForm {
   newUsername: string;
   currentPassword: string;
@@ -47,8 +48,7 @@ export default function ProfilePage() {
     if (localStorage.getItem('admin') === null) {
       const roleId = parseInt(localStorage.getItem('role_id') || '1', 10);
       adminFlag = roleId === 0;
-      // 补充设置admin字段，避免下次再次判断
-      localStorage.setItem('admin', adminFlag.toString());
+      // 仅在当前视图中推导；避免不持锁写入共享认证字段。
     }
     
     setUsername(name);
@@ -93,8 +93,15 @@ export default function ProfilePage() {
   ];
 
   // 退出登录
-  const handleLogout = () => {
-    safeLogout();
+  const handleLogout = async (expected?: ReturnType<typeof readAuthSnapshot>) => {
+    const result = await safeLogout(expected);
+    if (result === 'failed') {
+      toast.error('本地退出未确认，会话可能仍有效；请重试。');
+      return;
+    }
+    toast(result === 'local-only'
+      ? '已尽力清理本地会话；跨标签状态及服务端撤销均未确认。'
+      : '本地会话已清除；服务端注销结果未确认。', { icon: '⚠️', duration: 8000 });
     navigate('/', { replace: true });
   };
 
@@ -133,11 +140,12 @@ export default function ProfilePage() {
 
     setPasswordLoading(true);
     try {
+      const started = readAuthSnapshot();
       const response = await updatePassword(passwordForm);
       if (response.code === 0) {
         toast.success('密码修改成功，请重新登录');
         onOpenChange();
-        handleLogout();
+        await handleLogout(started);
       } else {
         toast.error(response.msg || '密码修改失败');
       }
@@ -224,7 +232,7 @@ export default function ProfilePage() {
               
               {/* 退出登录 */}
               <button
-                onClick={handleLogout}
+                onClick={() => { void handleLogout(); }}
                 className="flex flex-col items-center p-3 rounded-2xl bg-gray-50 dark:bg-default-100 hover:bg-gray-100 dark:hover:bg-default-200 transition-colors duration-200"
               >
                 <div className="w-10 h-10 bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400 rounded-full flex items-center justify-center mb-2">

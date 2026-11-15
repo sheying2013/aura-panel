@@ -144,8 +144,7 @@ export default function AdminLayout({
     if (localStorage.getItem('admin') === null) {
       const roleId = parseInt(localStorage.getItem('role_id') || '1', 10);
       adminFlag = roleId === 0;
-      // 补充设置admin字段，避免下次再次判断
-      localStorage.setItem('admin', adminFlag.toString());
+      // 仅在当前视图中推导；避免不持锁写入共享认证字段。
     }
     
     setUsername(name);
@@ -161,8 +160,15 @@ export default function AdminLayout({
   }, []);
 
   // 退出登录
-  const handleLogout = () => {
-    safeLogout();
+  const handleLogout = async () => {
+    const result = await safeLogout();
+    if (result === 'failed') {
+      toast.error('本地退出未确认，会话可能仍有效；请重试。');
+      return;
+    }
+    toast(result === 'local-only'
+      ? '已尽力清理本地会话；跨标签状态及服务端撤销均未确认。'
+      : '本地会话已清除；服务端注销结果未确认。', { icon: '⚠️', duration: 8000 });
     navigate('/');
   };
 

@@ -132,6 +132,14 @@ CREATE TABLE IF NOT EXISTS flow_report_dedup (
   bucket BIGINT NOT NULL,
   created_time BIGINT NOT NULL
 );
+-- round63：登出吊销表。按 token 的会话标识 sid 吊销「这一次登录」，不再用 user.token_version
+-- 全局自增（跨标签旧会话迟到登出会把新登录的 token 一起打死）。expires_at 存 token 自己的 exp，
+-- 过期行由 TokenRevocationStore 定期删除。CREATE TABLE IF NOT EXISTS 让存量库启动即补表，不需要 ALTER。
+CREATE TABLE IF NOT EXISTS revoked_token (
+  token_id VARCHAR(64) PRIMARY KEY,
+  expires_at BIGINT NOT NULL
+);
+
 -- DDNS：目标域名的当前解析状态。独立成表，不改 forward 既有列，老库启动时由
 -- CREATE TABLE IF NOT EXISTS 自动补齐。
 CREATE TABLE IF NOT EXISTS ddns_record (

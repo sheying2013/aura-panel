@@ -13,6 +13,7 @@ import { Accordion, AccordionItem } from "@heroui/accordion";
 import toast from 'react-hot-toast';
 import axios from 'axios';
 
+import { getAuthSession, getToken, useAuthSession } from "@/utils/auth";
 
 import { 
   createNode, 
@@ -81,7 +82,28 @@ interface NodeForm {
   socks: number; // 0 关 1 开
 }
 
+/** 已复验会话的身份作用域；事件与异步回包都按它复核 */
+interface AuthScope {
+  identityKey: string;
+  revision: number;
+}
+
+/** 当前已复验会话；未复验、已注销或本地身份已变但尚未复验时返回 null */
+const readAuthScope = (): AuthScope | null => {
+  const current = getAuthSession();
+  if (current.state !== 'verified' || !current.token) return null;
+  return { identityKey: current.identityKey, revision: current.revision };
+};
+
+/** 事件到达时，身份是否仍是发起时那个已复验会话 */
+const isAuthScopeCurrent = (scope: AuthScope): boolean => {
+  const current = readAuthScope();
+  return current !== null && current.identityKey === scope.identityKey && current.revision === scope.revision;
+};
+
 export default function NodePage() {
+  // 身份只认已复验的会话：未复验不建连、不拉取节点数据
+  const session = useAuthSession();
   const [nodeList, setNodeList] = useState<Node[]>([]);
   const [loading, setLoading] = useState(false);
   const [dialogVisible, setDialogVisible] = useState(false);
@@ -97,14 +119,17 @@ export default function NodePage() {
   const [releasingAll, setReleasingAll] = useState(false);
   const [releasingNodeId, setReleasingNodeId] = useState<number | null>(null);
 
-  // 加载集群漂移熔断快照
-  const loadBreakers = async () => {
+  // 加载集群漂移熔断快照；scope 由调用方传入，回包时复核身份
+  const loadBreakers = async (scope: AuthScope | null = readAuthScope()) => {
+    if (!scope) return;
     try {
       const res = await getNodeBreakerStatus();
+      if (!isAuthScopeCurrent(scope)) return;
       if (res.code === 0 && res.data) {
         setBreakerData(res.data);
       }
     } catch (error) {
+      if (!isAuthScopeCurrent(scope)) return;
       console.warn('获取熔断状态失败', error);
     }
   };
@@ -124,37 +149,47 @@ export default function NodePage() {
 
   // 手动解除指定节点熔断
   const handleReleaseNode = async (nodeId: number, nodeName: string) => {
+    const scope = readAuthScope();
+    if (!scope) return;
+
     setReleasingNodeId(nodeId);
     try {
       const res = await releaseNodeBreaker({ nodeId });
+      if (!isAuthScopeCurrent(scope)) return;
       if (res.code === 0) {
         toast.success(`已放行节点 [${nodeName}] 的熔断保护 (${res.data?.released || 0} 项)`);
-        await loadBreakers();
+        await loadBreakers(scope);
       } else {
         toast.error(res.msg || '解除熔断失败');
       }
     } catch (error) {
+      if (!isAuthScopeCurrent(scope)) return;
       toast.error('网络请求失败');
     } finally {
-      setReleasingNodeId(null);
+      if (isAuthScopeCurrent(scope)) setReleasingNodeId(null);
     }
   };
 
   // 一键放行全局所有熔断
   const handleReleaseAll = async () => {
+    const scope = readAuthScope();
+    if (!scope) return;
+
     setReleasingAll(true);
     try {
       const res = await releaseNodeBreaker({ all: true });
+      if (!isAuthScopeCurrent(scope)) return;
       if (res.code === 0) {
         toast.success(`已解除集群全部熔断保护 (${res.data?.released || 0} 项)`);
-        await loadBreakers();
+        await loadBreakers(scope);
       } else {
         toast.error(res.msg || '解除全部熔断失败');
       }
     } catch (error) {
+      if (!isAuthScopeCurrent(scope)) return;
       toast.error('网络请求失败');
     } finally {
-      setReleasingAll(false);
+      if (isAuthScopeCurrent(scope)) setReleasingAll(false);
     }
   };
   const [form, setForm] = useState<NodeForm>({
@@ -177,26 +212,65 @@ export default function NodePage() {
   const [currentNodeName, setCurrentNodeName] = useState('');
   
   const websocketRef = useRef<WebSocket | null>(null);
+  // 当前 WebSocket 所属的已复验作用域：旧连接的迟到回调不能接管新会话
+  const websocketScopeRef = useRef<AuthScope | null>(null);
   const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const maxReconnectAttempts = 5;
+  // 已展示的身份指纹：换账号时先清空旧数据，同身份复验只重载
+  const displayedIdentityRef = useRef<string | null>(null);
+
+  // 身份作用域切换：上一账号的节点数据、熔断快照与弹窗全部丢掉
+  const resetIdentityState = () => {
+    setNodeList([]);
+    setBreakerData(null);
+    setLoading(false);
+    setDialogVisible(false);
+    setDeleteModalOpen(false);
+    setNodeToDelete(null);
+    setInstallCommandModal(false);
+    setInstallCommand('');
+    setCurrentNodeName('');
+    setSubmitLoading(false);
+    setDeleteLoading(false);
+    setReleasingAll(false);
+    setReleasingNodeId(null);
+  };
 
   useEffect(() => {
+    if (session.state !== "verified") {
+      // 身份未知 / 已注销：作废旧连接，清空上一账号的节点数据
+      closeWebSocket();
+      displayedIdentityRef.current = null;
+      resetIdentityState();
+      return;
+    }
+
+    if (displayedIdentityRef.current !== session.identityKey) {
+      displayedIdentityRef.current = session.identityKey;
+      resetIdentityState();
+    }
+
     loadNodes();
     loadBreakers();
     initWebSocket();
-    
+
     return () => {
       closeWebSocket();
     };
-  }, []);
+  }, [session.state, session.identityKey, session.revision]);
 
   // 加载节点列表
   const loadNodes = async () => {
+    const scope = readAuthScope();
+    if (!scope) return;
+
     setLoading(true);
-    loadBreakers();
+    loadBreakers(scope);
     try {
       const res = await getNodeList();
+      // 旧身份 / 已失效会话的响应一律丢弃，不得覆盖新会话的列表
+      if (!isAuthScopeCurrent(scope)) return;
       if (res.code === 0) {
         setNodeList(res.data.map((node: any) => ({
           ...node,
@@ -208,55 +282,80 @@ export default function NodePage() {
         toast.error(res.msg || '加载节点列表失败');
       }
     } catch (error) {
+      if (!isAuthScopeCurrent(scope)) return;
       toast.error('网络错误，请重试');
     } finally {
-      setLoading(false);
+      if (isAuthScopeCurrent(scope)) setLoading(false);
     }
   };
 
   // 初始化WebSocket连接
   const initWebSocket = () => {
-    if (websocketRef.current && 
-        (websocketRef.current.readyState === WebSocket.OPEN || 
-         websocketRef.current.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
-    
-    if (websocketRef.current) {
+    const scope = readAuthScope();
+    if (!scope) return;
+
+    const existing = websocketRef.current;
+    if (existing) {
+      const existingScope = websocketScopeRef.current;
+      const sameScope = existingScope !== null &&
+        existingScope.identityKey === scope.identityKey &&
+        existingScope.revision === scope.revision;
+      if (sameScope &&
+          (existing.readyState === WebSocket.OPEN ||
+           existing.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
       closeWebSocket();
     }
-    
+
+    // 只允许用已复验的 token 建连：未提交 / 已注销的代次一律不建
+    const secret = getToken();
+    if (!secret) return;
+
     // 构建WebSocket URL，使用axios的baseURL
     const baseUrl = axios.defaults.baseURL || (import.meta.env.VITE_API_BASE ? `${import.meta.env.VITE_API_BASE}/api/v1/` : '/api/v1/');
-    const wsUrl = baseUrl.replace(/^http/, 'ws').replace(/\/api\/v1\/$/, '') + `/system-info?type=0&secret=${localStorage.getItem('token')}`;
-    
+    const wsUrl = baseUrl.replace(/^http/, 'ws').replace(/\/api\/v1\/$/, '') + `/system-info?type=0&secret=${encodeURIComponent(secret)}`;
+
+    let socket: WebSocket;
     try {
-      websocketRef.current = new WebSocket(wsUrl);
-      
-      websocketRef.current.onopen = () => {
-        reconnectAttemptsRef.current = 0;
-      };
-      
-      websocketRef.current.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          handleWebSocketMessage(data);
-        } catch (error) {
-          // 解析失败时不输出错误信息
-        }
-      };
-      
-      websocketRef.current.onerror = () => {
-        // WebSocket错误时不输出错误信息
-      };
-      
-      websocketRef.current.onclose = () => {
-        websocketRef.current = null;
-        attemptReconnect();
-      };
+      socket = new WebSocket(wsUrl);
     } catch (error) {
-      attemptReconnect();
+      attemptReconnect(scope);
+      return;
     }
+
+    websocketRef.current = socket;
+    websocketScopeRef.current = scope;
+
+    // 每条回调都复核「连接对象仍是当前连接」且「身份仍是建连时的已复验身份」，
+    // 旧身份 / 已被接管的连接迟到事件一律丢弃。
+    socket.onopen = () => {
+      if (websocketRef.current !== socket || !isAuthScopeCurrent(scope)) return;
+      reconnectAttemptsRef.current = 0;
+    };
+
+    socket.onmessage = (event) => {
+      if (websocketRef.current !== socket || !isAuthScopeCurrent(scope)) return;
+      try {
+        const data = JSON.parse(event.data);
+        handleWebSocketMessage(data);
+      } catch (error) {
+        // 解析失败时不输出错误信息
+      }
+    };
+
+    socket.onerror = () => {
+      // WebSocket错误时不输出错误信息
+    };
+
+    socket.onclose = () => {
+      // 旧连接的 onclose 不得清掉新会话的连接引用，也不得替新身份重连
+      if (websocketRef.current !== socket) return;
+      websocketRef.current = null;
+      websocketScopeRef.current = null;
+      if (!isAuthScopeCurrent(scope)) return;
+      attemptReconnect(scope);
+    };
   };
 
   // 处理WebSocket消息
@@ -337,15 +436,21 @@ export default function NodePage() {
     }
   };
 
-  // 尝试重新连接
-  const attemptReconnect = () => {
-    if (reconnectAttemptsRef.current < maxReconnectAttempts) {
-      reconnectAttemptsRef.current++;
-      
-      reconnectTimerRef.current = setTimeout(() => {
-        initWebSocket();
-      }, 3000 * reconnectAttemptsRef.current);
+  // 尝试重新连接；身份失效或已切换时不排重连，交给新作用域的 effect 建连
+  const attemptReconnect = (scope: AuthScope) => {
+    if (!isAuthScopeCurrent(scope)) return;
+    if (reconnectAttemptsRef.current >= maxReconnectAttempts) return;
+
+    reconnectAttemptsRef.current++;
+
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
     }
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      if (!isAuthScopeCurrent(scope)) return;
+      initWebSocket();
+    }, 3000 * reconnectAttemptsRef.current);
   };
 
   // 关闭WebSocket连接
@@ -356,7 +461,8 @@ export default function NodePage() {
     }
     
     reconnectAttemptsRef.current = 0;
-    
+    websocketScopeRef.current = null;
+
     if (websocketRef.current) {
       websocketRef.current.onopen = null;
       websocketRef.current.onmessage = null;
@@ -569,39 +675,51 @@ export default function NodePage() {
   };
 
   const confirmDelete = async () => {
-    if (!nodeToDelete) return;
-    
+    const target = nodeToDelete;
+    const scope = readAuthScope();
+    if (!target || !scope) return;
+
     setDeleteLoading(true);
     try {
-      const res = await deleteNode(nodeToDelete.id);
+      const res = await deleteNode(target.id);
+      // 旧身份 / 已失效会话返回的删除结果不得改动新会话的列表与弹窗
+      if (!isAuthScopeCurrent(scope)) return;
       if (res.code === 0) {
         toast.success('删除成功');
-        setNodeList(prev => prev.filter(n => n.id !== nodeToDelete.id));
+        setNodeList(prev => prev.filter(n => n.id !== target.id));
         setDeleteModalOpen(false);
         setNodeToDelete(null);
       } else {
         toast.error(res.msg || '删除失败');
       }
     } catch (error) {
+      if (!isAuthScopeCurrent(scope)) return;
       toast.error('网络错误，请重试');
     } finally {
-      setDeleteLoading(false);
+      if (isAuthScopeCurrent(scope)) setDeleteLoading(false);
     }
   };
 
   // 复制安装命令
   const handleCopyInstallCommand = async (node: Node) => {
+    const scope = readAuthScope();
+    if (!scope) return;
+
     setNodeList(prev => prev.map(n => 
       n.id === node.id ? { ...n, copyLoading: true } : n
     ));
     
     try {
       const res = await getNodeInstallCommand(node.id);
+      // 旧会话的安装命令不得写进剪贴板 / 新会话的弹窗
+      if (!isAuthScopeCurrent(scope)) return;
       if (res.code === 0 && res.data) {
         try {
           await navigator.clipboard.writeText(res.data);
+          if (!isAuthScopeCurrent(scope)) return;
           toast.success('安装命令已复制到剪贴板');
         } catch (copyError) {
+          if (!isAuthScopeCurrent(scope)) return;
           // 复制失败，显示安装命令模态框
           setInstallCommand(res.data);
           setCurrentNodeName(node.name);
@@ -611,11 +729,14 @@ export default function NodePage() {
         toast.error(res.msg || '获取安装命令失败');
       }
     } catch (error) {
+      if (!isAuthScopeCurrent(scope)) return;
       toast.error('获取安装命令失败');
     } finally {
-      setNodeList(prev => prev.map(n => 
-        n.id === node.id ? { ...n, copyLoading: false } : n
-      ));
+      if (isAuthScopeCurrent(scope)) {
+        setNodeList(prev => prev.map(n =>
+          n.id === node.id ? { ...n, copyLoading: false } : n
+        ));
+      }
     }
   };
 
@@ -633,9 +754,11 @@ export default function NodePage() {
   // 提交表单
   const handleSubmit = async () => {
     if (!validateForm()) return;
-    
+    const scope = readAuthScope();
+    if (!scope) return;
+
     setSubmitLoading(true);
-    
+
     try {
       const apiCall = isEdit ? updateNode : createNode;
       const data = { 
@@ -643,6 +766,8 @@ export default function NodePage() {
       };
       
       const res = await apiCall(data);
+      // 旧身份 / 已失效会话的提交结果不得改动新会话的列表与弹窗
+      if (!isAuthScopeCurrent(scope)) return;
       if (res.code === 0) {
         toast.success(isEdit ? '更新成功' : '创建成功');
         setDialogVisible(false);
@@ -669,9 +794,10 @@ export default function NodePage() {
         toast.error(res.msg || (isEdit ? '更新失败' : '创建失败'));
       }
     } catch (error) {
+      if (!isAuthScopeCurrent(scope)) return;
       toast.error('网络错误，请重试');
     } finally {
-      setSubmitLoading(false);
+      if (isAuthScopeCurrent(scope)) setSubmitLoading(false);
     }
   };
 
